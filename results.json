@@ -1,0 +1,13 @@
+{
+  "har_rmse": 2.2252996855853492e-05,
+  "lgbm_rmse": 7.593861844986874e-06,
+  "rmse": 7.593861844986874e-06,
+  "auroc": 0.5097339390006489,
+  "auprc": 0.2457528890239338,
+  "diebold_mariano": {
+    "statistic": 13.372037868750583,
+    "p_value": 0.0,
+    "model1_better": false,
+    "interpretation": "Model 2 significantly better"
+  }
+}
