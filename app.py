@@ -130,13 +130,13 @@ def render_lob_visualization(df):
         st.write("**Bids (Buy Orders)**")
         if bids:
             bids_df = pl.DataFrame(bids).sort("Price", descending=True)
-            st.dataframe(bids_df, use_container_width=True, hide_index=True)
+            st.dataframe(bids_df, width='stretch', hide_index=True)
 
     with col2:
         st.write("**Asks (Sell Orders)**")
         if asks:
             asks_df = pl.DataFrame(asks).sort("Price")
-            st.dataframe(asks_df, use_container_width=True, hide_index=True)
+            st.dataframe(asks_df, width='stretch', hide_index=True)
 
 
 def render_price_chart(df):
@@ -173,7 +173,7 @@ def render_price_chart(df):
                     overlaying="y", side="right"),
         height=400,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def render_feature_analysis(df):
@@ -223,12 +223,12 @@ def render_feature_analysis(df):
             fig = px.imshow(
                 corr_data,
                 color_continuous_scale="RdBu_r",
-                zmid=0,
+                color_continuous_midpoint=0,
                 title="Feature Correlation Matrix",
                 aspect="auto"
             )
             fig.update_layout(height=500)
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
     except Exception as e:
         st.error(f"Feature engineering failed: {e}")
@@ -267,7 +267,7 @@ def render_model_predictions(df):
                     with open(models_dir / "lgbm_model.pkl", "rb") as f:
                         lgbm = pickle.load(f)
 
-                    X_latest = latest_features[fcols].values[-1:] if fcols else None
+                    X_latest = latest_features[fcols].iloc[-1:] if fcols else None
                     if X_latest is not None and X_latest.shape[1] > 0:
                         rv_pred = lgbm.predict_rv(X_latest)
                         st.metric("Predicted RV (next period)", f"{rv_pred[0]:.4f}")
@@ -283,7 +283,7 @@ def render_model_predictions(df):
                     with open(models_dir / "lgbm_model.pkl", "rb") as f:
                         lgbm = pickle.load(f)
 
-                    X_latest = latest_features[fcols].values[-1:] if fcols else None
+                    X_latest = latest_features[fcols].iloc[-1:] if fcols else None
                     if X_latest is not None and X_latest.shape[1] > 0:
                         shock_prob = lgbm.predict_shock_proba(X_latest)[0]
                         shock_class = "⚠️ Shock Likely" if shock_prob[1] > 0.5 else "✓ Normal"
@@ -388,73 +388,6 @@ def render_data_collection():
                 st.error(f"Upload failed: {e}")
 
 
-def render_training_pipeline():
-    """Render training pipeline interface."""
-    st.subheader("🚀 Training Pipeline")
-
-    col1, col2 = st.columns(2)
-
-    with col1:
-        st.write("**Select Data Source**")
-        source = st.selectbox("Data Source", ["parquet", "kraken"], key="source")
-
-        if source == "parquet":
-            data_dir = Path("data/raw")
-            files = list(data_dir.glob("*.parquet")) if data_dir.exists() else []
-            if files:
-                selected_file = st.selectbox(
-                    "Select File",
-                    [f.name for f in files],
-                    key="file_select"
-                )
-                data_path = str(data_dir / selected_file)
-            else:
-                st.warning("No parquet files found in data/raw")
-                data_path = None
-        else:
-            pair = st.selectbox("Kraken Pair", ["XBTUSD", "ETHUSD"], key="pair_train")
-            data_path = None
-
-    with col2:
-        st.write("**Training Options**")
-        train_lgbm = st.checkbox("Train LightGBM", value=True)
-        train_har = st.checkbox("Train HAR-RV", value=True)
-        train_lstm = st.checkbox("Train LSTM", value=False)
-
-    if st.button("🏋️ Start Training", key="train"):
-        with st.spinner("Training models..."):
-            try:
-                from train import train
-                from config import PipelineConfig
-
-                cfg = PipelineConfig()
-
-                # Handle data_path for parquet source
-                if source == "parquet" and data_path:
-                    cfg.data.source = "parquet"
-                    results = train(cfg, data_path=data_path)
-                else:
-                    cfg.data.source = source
-                    if source == "kraken":
-                        cfg.data.symbol = pair
-                    results = train(cfg)
-
-                st.success("✓ Training completed!")
-
-                # Show results
-                if isinstance(results, dict):
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("RMSE", f"{results.get('rmse', 0):.4f}")
-                    with col2:
-                        st.metric("AUROC", f"{results.get('auroc', 0):.3f}")
-                    with col3:
-                        st.metric("AUPRC", f"{results.get('auprc', 0):.3f}")
-
-            except Exception as e:
-                st.error(f"Training failed: {e}")
-                st.write(str(e))
-
 
 def main():
     """Main dashboard entry point."""
@@ -470,7 +403,6 @@ def main():
     page = st.sidebar.radio("Select Page", [
         "Dashboard",
         "Data Collection",
-        "Training",
         "Settings"
     ])
 
@@ -501,9 +433,6 @@ def main():
 
     elif page == "Data Collection":
         render_data_collection()
-
-    elif page == "Training":
-        render_training_pipeline()
 
     elif page == "Settings":
         st.subheader("⚙️ Settings")

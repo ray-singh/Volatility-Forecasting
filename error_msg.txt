@@ -1,0 +1,13 @@
+========================================================================
+  7. LSTM Dual-Head Model
+========================================================================
+  hidden=64  layers=2  seq_len=50  epochs=15  batch=256
+  Device: mps
+Finished scaling features
+Built 370 sequences of length 50
+X_seq shape: (370, 50, 10), y_rv_seq shape: (370,), y_shock_seq shape: (370,)
+Finished building sequences
+[LSTM] Moving model to mps (MPS first-run compiles Metal shaders, may take ~30s)...
+[LSTM] Model ready on mps. Starting training...
+Built 40 sequences of length 50
+X_seq shape: (40, 50, 10), y_rv_seq shape: (40,), y_shock_seq shape: (40,)

@@ -35,16 +35,19 @@ def build_features(
     if rv_windows is None:
         rv_windows = [50, 300]
 
-    # Returns
+    # Log returns (more appropriate than pct_change for RV)
     df = df.with_columns(
-        pl.col("mid_price").pct_change().alias("log_return")
+        (pl.col("mid_price") / pl.col("mid_price").shift(1)).log().alias("log_return")
     )
 
-    # Realized volatility for each window
+    # Realized volatility: sqrt of sum of squared log returns over window
+    # RV_t = sqrt(sum_{i=t-w+1}^{t} r_i^2)  -- Andersen & Bollerslev (1998)
+    # rolling_std is wrong here: it demeans and uses (n-1), biasing RV downward
     for window in rv_windows:
         df = df.with_columns(
-            pl.col("log_return")
-            .rolling_std(window_size=window)
+            (pl.col("log_return") ** 2)
+            .rolling_sum(window_size=window)
+            .sqrt()
             .alias(f"rv_{window}")
         )
 
@@ -57,20 +60,34 @@ def build_features(
         ).alias("spread_zscore_50"),
     )
 
-    # Queue imbalance: bid volume vs ask volume at top level
+    # Queue imbalance: normalized ratio of bid vs ask volume at top level
     df = df.with_columns(
         (pl.col("bid_q0") / (pl.col("ask_q0") + 1e-9)).alias("queue_imbalance")
     )
 
-    # Order flow imbalance: signed order flow
+    # Order flow imbalance (Cont, Kukanov & Stoikov 2014)
+    # OFI_t = dV^B_t - dV^A_t where deltas are sign-adjusted for price moves:
+    #   bid contribution: +delta_bid_q if bid price unchanged/higher, else -bid_q
+    #   ask contribution: +delta_ask_q if ask price unchanged/lower, else -ask_q
+    df = df.with_columns([
+        pl.col("bid_p0").diff().alias("_dbid_p"),
+        pl.col("ask_p0").diff().alias("_dask_p"),
+        pl.col("bid_q0").diff().alias("_dbid_q"),
+        pl.col("ask_q0").diff().alias("_dask_q"),
+    ])
     df = df.with_columns(
         (
-            (pl.col("bid_q0") - pl.col("ask_q0"))
-            / (pl.col("bid_q0") + pl.col("ask_q0") + 1e-9)
+            pl.when(pl.col("_dbid_p") >= 0)
+              .then(pl.col("_dbid_q"))
+              .otherwise(-pl.col("bid_q0"))
+            - pl.when(pl.col("_dask_p") <= 0)
+              .then(pl.col("_dask_q"))
+              .otherwise(pl.col("ask_q0"))
         )
         .rolling_mean(window_size=ofi_window)
         .alias(f"ofi_{ofi_window}")
     )
+    df = df.drop(["_dbid_p", "_dask_p", "_dbid_q", "_dask_q"])
 
     # Trade intensity: mid-price changes per window
     df = df.with_columns(
@@ -90,9 +107,11 @@ def build_features(
     )
 
     # Target: realized volatility (next 50 ticks)
+    # Shift -50 so the target is the RV of the *next* 50 ticks
     df = df.with_columns(
-        pl.col("log_return")
-        .rolling_std(window_size=50)
+        (pl.col("log_return") ** 2)
+        .rolling_sum(window_size=50)
+        .sqrt()
         .shift(-50)
         .alias("target_rv")
     )

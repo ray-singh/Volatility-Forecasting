@@ -38,8 +38,8 @@ class ModelConfig:
     lstm_hidden: int = 64
     lstm_layers: int = 2
     lstm_seq_len: int = 50
-    lstm_epochs: int = 30
-    lstm_batch: int = 128
+    lstm_epochs: int = 15
+    lstm_batch: int = 256
 
 
 @dataclass

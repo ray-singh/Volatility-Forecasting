@@ -52,15 +52,21 @@ def make_splits(
     train_end = int(n * train_frac)
     val_end = train_end + int(n * val_frac)
 
-    # Extract features and targets
-    X = feat_df.select(feature_cols).to_numpy()
-    y_rv = feat_df.select("target_rv").to_numpy().ravel()
-    y_shock = feat_df.select("target_shock").to_numpy().ravel()
+    # Extract features and targets — np.ascontiguousarray ensures correct
+    # strides for downstream stride_tricks usage in sequence building
+    X = np.ascontiguousarray(feat_df.select(feature_cols).to_numpy())
+    y_rv = np.ascontiguousarray(feat_df.select("target_rv").to_numpy().ravel())
+    y_shock = np.ascontiguousarray(feat_df.select("target_shock").to_numpy().ravel().astype(np.int64))
 
-    # Chronological split
-    X_train, X_val, X_test = X[:train_end], X[train_end:val_end], X[val_end:]
-    y_rv_train, y_rv_val, y_rv_test = y_rv[:train_end], y_rv[train_end:val_end], y_rv[val_end:]
-    y_shock_train, y_shock_val, y_shock_test = y_shock[:train_end], y_shock[train_end:val_end], y_shock[val_end:]
+    # Chronological split — .copy() ensures each array owns its memory
+    # (slices are views; dangling references cause segfaults in PyTorch)
+    X_train, X_val, X_test = X[:train_end].copy(), X[train_end:val_end].copy(), X[val_end:].copy()
+    y_rv_train = y_rv[:train_end].copy()
+    y_rv_val   = y_rv[train_end:val_end].copy()
+    y_rv_test  = y_rv[val_end:].copy()
+    y_shock_train = y_shock[:train_end].copy()
+    y_shock_val   = y_shock[train_end:val_end].copy()
+    y_shock_test  = y_shock[val_end:].copy()
 
     return Splits(
         X_train=X_train,
