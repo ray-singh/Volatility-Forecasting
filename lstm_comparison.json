@@ -1,0 +1,164 @@
+{
+  "lgbm_baseline": {
+    "rv_metrics": {
+      "rmse": 7.579108993616445e-05,
+      "mae": 5.709663620695167e-05,
+      "qlike": 2.150520307241422
+    },
+    "shock_metrics": {
+      "auroc": 0.6549712483769246,
+      "auprc": 0.5400963862133485,
+      "brier": 0.08032828981649322
+    }
+  },
+  "lstm_results": {
+    "Baseline": {
+      "config": {
+        "name": "Baseline",
+        "seq_len": 50,
+        "hidden_size": 64,
+        "num_layers": 2,
+        "epochs": 15,
+        "batch_size": 256,
+        "rv_loss_weight": 1.0,
+        "patience": 10,
+        "lr": 0.001
+      },
+      "rv_metrics": {
+        "rmse": 0.010799488135953836,
+        "mae": 0.004696787370512989,
+        "qlike": 26.22255322859752
+      },
+      "shock_metrics": {
+        "auroc": 0.612762010758672,
+        "auprc": 0.3060930109287327,
+        "brier": 0.1148299570803036
+      },
+      "fit_time": 5.990310041999692,
+      "loss_summary": {
+        "epochs_trained": 15,
+        "train_loss_initial": 0.7836243405471751,
+        "train_loss_final": 0.02312623552796662,
+        "train_loss_improved": 97.04881097595583,
+        "val_loss_initial": 0.5872999724923257,
+        "val_loss_final": 0.36813439919283397,
+        "val_loss_improved": 37.31748400556167
+      },
+      "vs_lgbm": {
+        "rmse_improvement_pct": -14149.020755671645,
+        "auroc_improvement_pct": -4.220923761825257
+      }
+    },
+    "Large-SeqLen": {
+      "config": {
+        "name": "Large-SeqLen",
+        "seq_len": 100,
+        "hidden_size": 128,
+        "num_layers": 2,
+        "epochs": 20,
+        "batch_size": 128,
+        "rv_loss_weight": 1.0,
+        "patience": 12,
+        "lr": 0.001
+      },
+      "rv_metrics": {
+        "rmse": 0.014993883850151317,
+        "mae": 0.009657304228140068,
+        "qlike": 21.517057930630333
+      },
+      "shock_metrics": {
+        "auroc": 0.6736969022444815,
+        "auprc": 0.27636991996580734,
+        "brier": 0.11677693052384085
+      },
+      "fit_time": 12.356421416998273,
+      "loss_summary": {
+        "epochs_trained": 15,
+        "train_loss_initial": 0.2960896139747262,
+        "train_loss_final": 0.017102986480644313,
+        "train_loss_improved": 94.22371279726678,
+        "val_loss_initial": 0.1382601836658254,
+        "val_loss_final": 0.426560915471213,
+        "val_loss_improved": -208.52043166831743
+      },
+      "vs_lgbm": {
+        "rmse_improvement_pct": -19683.174859709783,
+        "auroc_improvement_pct": 1.872565386755698
+      }
+    },
+    "XLarge": {
+      "config": {
+        "name": "XLarge",
+        "seq_len": 150,
+        "hidden_size": 256,
+        "num_layers": 2,
+        "epochs": 25,
+        "batch_size": 64,
+        "rv_loss_weight": 1.0,
+        "patience": 15,
+        "lr": 0.0005
+      },
+      "rv_metrics": {
+        "rmse": 0.005060032463053127,
+        "mae": 0.0010469256837256002,
+        "qlike": 34.66476385556329
+      },
+      "shock_metrics": {
+        "auroc": 0.5825820812465219,
+        "auprc": 0.21879563420779116,
+        "brier": 0.11876452582326602
+      },
+      "fit_time": 39.09296212499976,
+      "loss_summary": {
+        "epochs_trained": 16,
+        "train_loss_initial": 0.22218925892392133,
+        "train_loss_final": 0.008467259111264164,
+        "train_loss_improved": 96.18916812078508,
+        "val_loss_initial": 0.13529900059824096,
+        "val_loss_final": 0.20984185121686902,
+        "val_loss_improved": -55.09490113676213
+      },
+      "vs_lgbm": {
+        "rmse_improvement_pct": -6576.289346564316,
+        "auroc_improvement_pct": -7.2389167130402665
+      }
+    },
+    "Deep": {
+      "config": {
+        "name": "Deep",
+        "seq_len": 100,
+        "hidden_size": 256,
+        "num_layers": 3,
+        "epochs": 20,
+        "batch_size": 128,
+        "rv_loss_weight": 1.0,
+        "patience": 12,
+        "lr": 0.001
+      },
+      "rv_metrics": {
+        "rmse": 0.03444834914331203,
+        "mae": 0.02558746371100543,
+        "qlike": 8.765639045019503
+      },
+      "shock_metrics": {
+        "auroc": 0.5320905212391022,
+        "auprc": 0.2155416609533407,
+        "brier": 0.119413033957515
+      },
+      "fit_time": 23.106772582999838,
+      "loss_summary": {
+        "epochs_trained": 12,
+        "train_loss_initial": 0.1888997198249744,
+        "train_loss_final": 0.012222100382684523,
+        "train_loss_improved": 93.52984726816486,
+        "val_loss_initial": 0.11984487019834064,
+        "val_loss_final": 0.19022627563697292,
+        "val_loss_improved": -58.72709054809988
+      },
+      "vs_lgbm": {
+        "rmse_improvement_pct": -45351.713614788205,
+        "auroc_improvement_pct": -12.288072713782238
+      }
+    }
+  }
+}

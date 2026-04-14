@@ -1,26 +1,32 @@
 """
 Kraken L2 order-book data ingestion.
 
-Polls the Kraken REST endpoint  GET /0/public/Depth  at a configurable
-interval and emits one LOB snapshot row per poll, normalised to the same
-schema produced by generate_synthetic_lob() so the feature pipeline works
-unchanged.
+Two collection modes:
+  1. REST polling  — collect_kraken_snapshots()
+     Polls GET /0/public/Depth at a configurable interval.
 
-Schema (one row = one snapshot):
-    timestamp_ns : int64   — poll time in nanoseconds
+  2. WebSocket streaming — collect_kraken_ws_snapshots()
+     Subscribes to the Kraken WebSocket v2 `book` channel for real-time
+     order-book updates. Each snapshot is taken whenever the book changes,
+     up to `n_snapshots` total, or after `timeout_s` seconds.
+
+Both emit the same LOB schema so the feature pipeline works unchanged:
+    timestamp_ns : int64   — event time in nanoseconds
     mid_price    : float64 — (best_bid + best_ask) / 2
     spread       : float64 — best_ask - best_bid
     bid_p{i}     : float64 — bid price at level i  (i = 0 … levels-1)
     bid_q{i}     : float64 — bid quantity at level i
     ask_p{i}     : float64 — ask price at level i
     ask_q{i}     : float64 — ask quantity at level i
-    last_trade_qty: float64 — None (Kraken /Depth does not include trades)
+    last_trade_qty: float64 — None (not available from /Depth or book channel)
 
-Kraken API reference:
-    https://docs.kraken.com/api/docs/rest-api/get-order-book
+Kraken API references:
+    REST:  https://docs.kraken.com/api/docs/rest-api/get-order-book
+    WS v2: https://docs.kraken.com/api/docs/websocket-v2/book
 """
 from __future__ import annotations
 
+import asyncio
 import time
 import urllib.request
 import json
@@ -156,6 +162,189 @@ def collect_kraken_snapshots(
 
 
 # ---------------------------------------------------------------------------
+# WebSocket streaming collector
+# ---------------------------------------------------------------------------
+
+_KRAKEN_WS_URL = "wss://ws.kraken.com/v2"
+
+# Kraken WS v2 uses different symbol format: BTC/USD instead of XBTUSD
+_WS_SYMBOL_MAP = {
+    "XBTUSD":  "BTC/USD",
+    "ETHUSD":  "ETH/USD",
+    "DOGEUSD": "DOGE/USD",
+    "SOLUSD":  "SOL/USD",
+}
+
+
+def _apply_book_delta(
+    bids: dict[float, float],
+    asks: dict[float, float],
+    delta: dict,
+) -> None:
+    """
+    Apply one WS book update (snapshot or delta) in-place to the local
+    bid/ask dicts, keyed by price → quantity. Zero quantity = remove level.
+
+    Kraken WS v2 sends levels as {"price": float, "qty": float} dicts.
+    """
+    for level in delta.get("bids", []):
+        price, qty = float(level["price"]), float(level["qty"])
+        if qty == 0.0:
+            bids.pop(price, None)
+        else:
+            bids[price] = qty
+
+    for level in delta.get("asks", []):
+        price, qty = float(level["price"]), float(level["qty"])
+        if qty == 0.0:
+            asks.pop(price, None)
+        else:
+            asks[price] = qty
+
+
+def _book_to_row(bids: dict, asks: dict, levels: int) -> dict[str, Any] | None:
+    """Convert current best-N bid/ask dicts into a LOB snapshot row."""
+    sorted_bids = sorted(bids.items(), key=lambda x: -x[0])[:levels]
+    sorted_asks = sorted(asks.items(), key=lambda x:  x[0])[:levels]
+
+    if not sorted_bids or not sorted_asks:
+        return None
+
+    row: dict[str, Any] = {"timestamp_ns": time.time_ns()}
+    for i in range(levels):
+        if i < len(sorted_bids):
+            row[f"bid_p{i}"], row[f"bid_q{i}"] = sorted_bids[i]
+        else:
+            row[f"bid_p{i}"], row[f"bid_q{i}"] = float("nan"), 0.0
+        if i < len(sorted_asks):
+            row[f"ask_p{i}"], row[f"ask_q{i}"] = sorted_asks[i]
+        else:
+            row[f"ask_p{i}"], row[f"ask_q{i}"] = float("nan"), 0.0
+
+    row["mid_price"] = (sorted_bids[0][0] + sorted_asks[0][0]) / 2.0
+    row["spread"]    = sorted_asks[0][0] - sorted_bids[0][0]
+    row["last_trade_qty"] = None
+    return row
+
+
+async def _ws_collect(
+    symbol: str,
+    n_snapshots: int,
+    levels: int,
+    timeout_s: float,
+    on_snapshot=None,
+) -> list[dict]:
+    """
+    Core async coroutine: subscribe to the Kraken WS v2 book channel,
+    maintain a local order book, and record a snapshot on every update.
+    """
+    import websockets
+
+    rows: list[dict] = []
+    bids: dict[float, float] = {}
+    asks: dict[float, float] = {}
+
+    subscribe_msg = json.dumps({
+        "method": "subscribe",
+        "params": {
+            "channel": "book",
+            "symbol": [symbol],
+            "depth":  max(levels, 10),  # Kraken minimum depth is 10
+        },
+    })
+
+    deadline = time.monotonic() + timeout_s
+
+    async with websockets.connect(_KRAKEN_WS_URL) as ws:
+        await ws.send(subscribe_msg)
+        print(f"[kraken-ws] subscribed to book/{symbol} (depth={max(levels,10)})")
+
+        while len(rows) < n_snapshots and time.monotonic() < deadline:
+            try:
+                remaining = deadline - time.monotonic()
+                raw = await asyncio.wait_for(ws.recv(), timeout=min(remaining, 5.0))
+            except asyncio.TimeoutError:
+                break
+
+            msg = json.loads(raw)
+
+            # Only process book channel messages
+            if msg.get("channel") != "book":
+                continue
+
+            msg_type = msg.get("type")  # "snapshot" | "update"
+            for entry in msg.get("data", []):
+                _apply_book_delta(bids, asks, entry)
+
+            if msg_type in ("snapshot", "update"):
+                row = _book_to_row(bids, asks, levels)
+                if row is not None:
+                    rows.append(row)
+                    if on_snapshot is not None:
+                        on_snapshot(len(rows), row)
+                    if len(rows) % 50 == 0 or len(rows) == 1:
+                        print(f"[kraken-ws]   {len(rows)}/{n_snapshots} snapshots "
+                              f"  mid={row['mid_price']:.2f}")
+
+    print(f"[kraken-ws] done — {len(rows)} snapshots collected")
+    return rows
+
+
+def _finalise_df(rows: list[dict], levels: int) -> pl.DataFrame:
+    """Convert row list to a polars DataFrame with depth_ratio column."""
+    df = pl.DataFrame(rows)
+    df = df.with_columns(pl.col("timestamp_ns").cast(pl.Int64))
+    bid_depth = sum(pl.col(f"bid_q{i}") for i in range(levels))
+    ask_depth = sum(pl.col(f"ask_q{i}") for i in range(levels))
+    df = df.with_columns(
+        (bid_depth / (ask_depth + 1e-9)).alias("depth_ratio")
+    )
+    return df
+
+
+def collect_kraken_ws_snapshots(
+    pair: str = "XBTUSD",
+    n_snapshots: int = 500,
+    levels: int = 10,
+    timeout_s: float = 300.0,
+    on_snapshot=None,
+) -> pl.DataFrame:
+    """
+    Stream Kraken order-book updates via WebSocket v2 and collect snapshots.
+
+    A snapshot is recorded on every book update message received from Kraken,
+    so the effective rate tracks real market activity (typically many per second
+    for liquid pairs). Collection stops when `n_snapshots` are reached or
+    `timeout_s` seconds elapse, whichever comes first.
+
+    Parameters
+    ----------
+    pair        : Kraken pair string (e.g. "XBTUSD", "ETHUSD").
+    n_snapshots : maximum number of snapshots to collect.
+    levels      : number of book levels to retain per side.
+    timeout_s   : hard time-limit in seconds (default 5 min).
+    on_snapshot : optional callback(count: int, row: dict) called per snapshot.
+
+    Returns
+    -------
+    pl.DataFrame in the standard LOB snapshot schema (same as REST collector).
+    """
+    symbol = _WS_SYMBOL_MAP.get(pair, pair.replace("USD", "/USD"))
+    print(f"[kraken-ws] collecting up to {n_snapshots} snapshots for {symbol} "
+          f"({levels} levels, timeout={timeout_s}s) …")
+
+    rows = asyncio.run(_ws_collect(symbol, n_snapshots, levels, timeout_s, on_snapshot))
+
+    if not rows:
+        raise RuntimeError("No snapshots collected from Kraken WebSocket.")
+
+    df = _finalise_df(rows, levels)
+    print(f"[kraken-ws] mid_price range "
+          f"[{df['mid_price'].min():.2f}, {df['mid_price'].max():.2f}]")
+    return df
+
+
+# ---------------------------------------------------------------------------
 # CLI smoke-test:  python kraken_feed.py
 # ---------------------------------------------------------------------------
 
@@ -166,16 +355,27 @@ if __name__ == "__main__":
     parser.add_argument("--pair",      default="XBTUSD", help="Kraken pair (e.g. XBTUSD)")
     parser.add_argument("--snapshots", type=int, default=20, help="Number of snapshots")
     parser.add_argument("--levels",    type=int, default=10, help="Book depth levels")
-    parser.add_argument("--interval",  type=float, default=1.0, help="Poll interval (s)")
+    parser.add_argument("--interval",  type=float, default=1.0, help="Poll interval (s) — REST only")
+    parser.add_argument("--timeout",   type=float, default=300.0, help="Timeout (s) — WS only")
+    parser.add_argument("--mode",      default="rest", choices=["rest", "ws"],
+                        help="Collection mode: rest (poll) or ws (WebSocket stream)")
     parser.add_argument("--out",       default=None, help="Save to parquet path")
     args = parser.parse_args()
 
-    df = collect_kraken_snapshots(
-        pair=args.pair,
-        n_snapshots=args.snapshots,
-        levels=args.levels,
-        poll_interval_s=args.interval,
-    )
+    if args.mode == "ws":
+        df = collect_kraken_ws_snapshots(
+            pair=args.pair,
+            n_snapshots=args.snapshots,
+            levels=args.levels,
+            timeout_s=args.timeout,
+        )
+    else:
+        df = collect_kraken_snapshots(
+            pair=args.pair,
+            n_snapshots=args.snapshots,
+            levels=args.levels,
+            poll_interval_s=args.interval,
+        )
     print(df.head())
 
     if args.out:
