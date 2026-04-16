@@ -263,6 +263,16 @@ def load_trained_models():
 
 
 def load_latest_data():
+    # Prefer CSV order-book files in data/csv/ (most recent day)
+    csv_dir = Path("data/csv")
+    if csv_dir.exists():
+        csv_files = sorted(csv_dir.glob("order-book-*.csv"))
+        if csv_files:
+            df = pl.read_csv(csv_files[-1], try_parse_dates=True)
+            if "mid" in df.columns and "mid_price" not in df.columns:
+                df = df.rename({"mid": "mid_price"})
+            return df
+    # Fallback to parquet
     data_dir = Path("data/raw")
     if not data_dir.exists():
         return None
@@ -347,10 +357,13 @@ def page_overview(df, results):
         mid   = df["mid_price"][-1] if "mid_price" in df.columns else None
         spd   = df["spread"].mean() if "spread" in df.columns else None
         n_obs = len(df)
-        dur_s = (
-            (df["timestamp_ns"].max() - df["timestamp_ns"].min()) / 1e9
-            if "timestamp_ns" in df.columns else None
-        )
+        if "timestamp_ns" in df.columns:
+            dur_s = (df["timestamp_ns"].max() - df["timestamp_ns"].min()) / 1e9
+        elif "ts" in df.columns:
+            ts_col = df["ts"]
+            dur_s = float((ts_col.max() - ts_col.min()).total_seconds())
+        else:
+            dur_s = None
         panels = [
             ("Mid Price", f"${mid:,.2f}" if mid else "—", "", True),
             ("Avg Spread", f"${spd:.5f}" if spd else "—", "", True),
@@ -430,7 +443,7 @@ def page_order_book(df):
         return
 
     latest = df.tail(1).to_dict(as_series=False)
-    LEVELS = 10
+    LEVELS = sum(1 for i in range(20) if f"bid_p{i}" in df.columns)
 
     bids, asks = [], []
     for i in range(LEVELS):
@@ -625,7 +638,6 @@ def _render_results_table(results: dict):
     rows = [
         ("HAR-RV",    results.get("har_rmse"),  results.get("har_mae"),  None,                   None,                    None),
         ("LightGBM",  results.get("lgbm_rmse"), results.get("lgbm_mae"), results.get("auroc"),   results.get("auprc"),    results.get("brier")),
-        ("LSTM",      results.get("lstm_rmse"),  None,                   results.get("lstm_auroc"), results.get("lstm_auprc"), results.get("lstm_brier")),
         ("TCN",       results.get("tcn_rmse"),   None,                   results.get("tcn_auroc"),  results.get("tcn_auprc"),  results.get("tcn_brier")),
     ]
 
@@ -687,7 +699,7 @@ def _render_multi_horizon(results: dict):
     model_keys   = [("HAR-RV",    "har",     "#ffd166"),
                     ("GARCH",     "garch",   WARN),
                     ("LightGBM",  "lgbm_rv", ACCENT),
-                    ("LSTM",      "lstm_rv",  ACCENT2),
+
                     ("TCN",       "tcn_rv",  "#06d6a0")]
     fig = go.Figure()
     for label, key, color in model_keys:
@@ -711,7 +723,6 @@ def _render_multi_horizon(results: dict):
     st.markdown('<div class="section-title">Shock Detection AUROC by Horizon</div>',
                 unsafe_allow_html=True)
     shock_keys = [("LightGBM", "lgbm_shock", ACCENT),
-                  ("LSTM",     "lstm_shock",  ACCENT2),
                   ("TCN",      "tcn_shock",   "#06d6a0")]
     fig2 = go.Figure()
     for label, key, color in shock_keys:
@@ -745,7 +756,6 @@ def _render_multi_horizon(results: dict):
             ("HAR-RV",   "har",      None),
             ("GARCH",    "garch",    None),
             ("LGBM",     "lgbm_rv",  "lgbm_shock"),
-            ("LSTM",     "lstm_rv",  "lstm_shock"),
             ("TCN",      "tcn_rv",   "tcn_shock"),
         ]:
             rv  = ph.get(rv_key, {})
@@ -907,7 +917,6 @@ def page_models(results):
         rmse_data = {
             "HAR-RV":   results.get("har_rmse"),
             "LightGBM": results.get("lgbm_rmse"),
-            "LSTM":     results.get("lstm_rmse"),
             "TCN":      results.get("tcn_rmse"),
         }
         rmse_data = {k: v for k, v in rmse_data.items() if v is not None}
@@ -933,12 +942,10 @@ def page_models(results):
 
         auroc_data = {k: v for k, v in {
             "LightGBM": results.get("auroc"),
-            "LSTM":     results.get("lstm_auroc"),
             "TCN":      results.get("tcn_auroc"),
         }.items() if v is not None}
         auprc_data = {k: v for k, v in {
             "LightGBM": results.get("auprc"),
-            "LSTM":     results.get("lstm_auprc"),
             "TCN":      results.get("tcn_auprc"),
         }.items() if v is not None}
 
@@ -1078,28 +1085,33 @@ def page_data_collection():
     # ── Existing data files
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown('<div class="section-title">Available Data Files</div>', unsafe_allow_html=True)
+
+    all_files = []
+    csv_dir = Path("data/csv")
+    if csv_dir.exists():
+        all_files += sorted(csv_dir.glob("order-book-*.csv"), key=lambda p: p.name)
     data_dir = Path("data/raw")
     if data_dir.exists():
-        files = sorted(data_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
-        if files:
-            rows = ""
-            for fp in files[:20]:
-                size_kb = fp.stat().st_size / 1024
-                mtime   = datetime.fromtimestamp(fp.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-                rows += f"<tr><td>{fp.name}</td><td>{size_kb:.1f} KB</td><td>{mtime}</td></tr>"
-            tbl = f"""<table class="model-table">
-              <tr><th>File</th><th>Size</th><th>Modified</th></tr>{rows}</table>"""
-            st.markdown(card(tbl, ""), unsafe_allow_html=True)
-        else:
-            _no_data_box("No parquet files in data/raw/")
+        all_files += sorted(data_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
+
+    if all_files:
+        rows = ""
+        for fp in all_files[:30]:
+            size_kb = fp.stat().st_size / 1024
+            mtime   = datetime.fromtimestamp(fp.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            rows += f"<tr><td>{fp.name}</td><td>{fp.parent.name}/</td><td>{size_kb:,.0f} KB</td><td>{mtime}</td></tr>"
+        tbl = f"""<table class="model-table">
+          <tr><th>File</th><th>Folder</th><th>Size</th><th>Modified</th></tr>{rows}</table>"""
+        st.markdown(card(tbl, ""), unsafe_allow_html=True)
     else:
-        _no_data_box("data/raw/ directory does not exist yet.")
+        _no_data_box("No data files found in data/csv/ or data/raw/")
 
     # ── CLI reminder
     st.markdown("<br>", unsafe_allow_html=True)
     st.markdown(
         f'<div class="info-box">'
         f'<strong>Training is done via CLI:</strong><br>'
+        f'<code>python train.py --source csv</code> &nbsp;(uses all CSVs in data/csv/)<br>'
         f'<code>python train.py --source parquet --path data/raw/&lt;file&gt;.parquet</code>'
         f'</div>',
         unsafe_allow_html=True,

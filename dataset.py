@@ -84,6 +84,9 @@ def make_splits(
     """
     Create chronological train/val/test splits for multiple forecast horizons.
 
+    Recomputes shock thresholds on the training slice only to avoid lookahead bias
+    in label construction.
+
     Parameters
     ----------
     feat_df : pl.DataFrame
@@ -108,6 +111,40 @@ def make_splits(
     n = len(feat_df)
     train_end = int(n * train_frac)
     val_end   = train_end + int(n * val_frac)
+
+    # Compute thresholds on training slice only to avoid lookahead bias
+    feat_df_train = feat_df.slice(0, train_end)
+    spread_threshold_train = float(feat_df_train["spread"].quantile(0.75))
+    depth_threshold_train = (
+        float(feat_df_train["depth_ratio"].quantile(0.25))
+        if "depth_ratio" in feat_df_train.columns else None
+    )
+
+    # Rebuild shock targets using training-only thresholds
+    for h_s in horizons:
+        h_ticks = max(1, int(round(h_s * 2.0)))  # Default ticks_per_second=2.0
+
+        ss_col = f"target_shock_spread_{h_s}s"
+        if ss_col in feat_df.columns:
+            feat_df = feat_df.with_columns(
+                (
+                    pl.col("spread")
+                    .shift(-(h_ticks - 1))
+                    .rolling_max(window_size=h_ticks)
+                    > spread_threshold_train
+                ).cast(pl.Int32).alias(ss_col)
+            )
+
+        sd_col = f"target_shock_depth_{h_s}s"
+        if sd_col in feat_df.columns and depth_threshold_train is not None:
+            feat_df = feat_df.with_columns(
+                (
+                    pl.col("depth_ratio")
+                    .shift(-(h_ticks - 1))
+                    .rolling_min(window_size=h_ticks)
+                    < depth_threshold_train
+                ).cast(pl.Int32).alias(sd_col)
+            )
 
     # Feature matrix — contiguous for stride_tricks in sequence building
     X = np.ascontiguousarray(feat_df.select(feature_cols).to_numpy())
@@ -137,19 +174,15 @@ def make_splits(
 
         ss_col = f"target_shock_spread_{h_s}s"
         if ss_col in feat_df.columns:
-            y_shock_spread[key] = _split(
-                np.ascontiguousarray(
-                    feat_df[ss_col].to_numpy().ravel().astype(np.int64)
-                )
-            )
+            arr = feat_df[ss_col].to_numpy().ravel()
+            arr = np.nan_to_num(arr, nan=0).astype(np.int64)
+            y_shock_spread[key] = _split(np.ascontiguousarray(arr))
 
         sd_col = f"target_shock_depth_{h_s}s"
         if sd_col in feat_df.columns:
-            y_shock_depth[key] = _split(
-                np.ascontiguousarray(
-                    feat_df[sd_col].to_numpy().ravel().astype(np.int64)
-                )
-            )
+            arr = feat_df[sd_col].to_numpy().ravel()
+            arr = np.nan_to_num(arr, nan=0).astype(np.int64)
+            y_shock_depth[key] = _split(np.ascontiguousarray(arr))
 
     return Splits(
         X_train=X_train,

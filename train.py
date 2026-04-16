@@ -23,6 +23,7 @@ os.environ["MLFLOW_ENABLE_SYSTEM_METRICS_LOGGING"] = "false"
 
 import numpy as np
 from sklearn.metrics import roc_auc_score, precision_recall_curve, auc
+from sklearn.calibration import CalibratedClassifierCV
 import mlflow
 
 import polars as pl
@@ -31,9 +32,9 @@ from config import PipelineConfig
 from engineer import build_features, feature_cols, clean
 from dataset import make_splits
 from models import (
-    DataLoader, HARRVModel, GARCHModel, LGBMDualModel,
-    DualHeadLSTM, TCNModel, diebold_mariano,
+    DataLoader, HARRVModel, GARCHModel, LGBMDualModel, diebold_mariano,
 )
+from deep_models import TCNModel, TransformerModel
 
 EXPERIMENT_NAME = "volatility-forecasting"
 
@@ -58,18 +59,26 @@ def _log(msg: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 
 def evaluate_rv_forecast(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
-    """Evaluate RV forecast with RMSE, MAE, and QLIKE loss."""
+    """Evaluate RV forecast with RMSE, MAE, and QLIKE loss.
+
+    QLIKE is computed on variance (squared RV), not volatility, following
+    Patton (2011). Input arrays should be volatility (standard deviation).
+    """
     rmse  = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
     mae   = float(np.mean(np.abs(y_true - y_pred)))
-    
-    # Clip predictions to avoid log(0) warnings
-    y_pred_clipped = np.clip(y_pred, 1e-6, None)
-    y_true_clipped = np.clip(y_true, 1e-6, None)
-    
-    # QLIKE: robust calculation with safeguards
-    ratio = y_true_clipped / y_pred_clipped
+
+    # QLIKE: convert RV (volatility) to variance, then compute
+    # QLIKE(h, sigma^2) = h / sigma^2 - log(h / sigma^2) - 1
+    y_true_var = np.square(y_true)
+    y_pred_var = np.square(y_pred)
+
+    # Clip to avoid log(0) and division by zero
+    y_pred_var_clipped = np.clip(y_pred_var, 1e-8, None)
+    y_true_var_clipped = np.clip(y_true_var, 1e-8, None)
+
+    ratio = y_true_var_clipped / y_pred_var_clipped
     qlike = float(np.mean(ratio - np.log(ratio) - 1))
-    
+
     return {"rmse": rmse, "mae": mae, "qlike": qlike}
 
 
@@ -80,6 +89,50 @@ def evaluate_shock_forecast(y_true: np.ndarray, y_pred_proba: np.ndarray) -> dic
     auprc = float(auc(recall, precision))
     brier = float(np.mean((y_pred_proba[:, 1] - y_true) ** 2))
     return {"auroc": auroc, "auprc": auprc, "brier": brier}
+
+
+def calibrate_shock_probabilities(
+    y_val: np.ndarray,
+    y_pred_proba_val: np.ndarray,
+    y_test: np.ndarray,
+    y_pred_proba_test: np.ndarray,
+) -> np.ndarray:
+    """
+    Calibrate shock probabilities using Platt scaling on validation set.
+
+    Parameters
+    ----------
+    y_val, y_pred_proba_val : np.ndarray
+        Validation set labels and raw probabilities (N, 2) from classifier.
+    y_test, y_pred_proba_test : np.ndarray
+        Test set labels and raw probabilities to calibrate.
+
+    Returns
+    -------
+    np.ndarray, shape (N_test, 2)
+        Calibrated probability predictions on test set.
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    # Drop NaN scores before fitting
+    raw_scores_val = y_pred_proba_val[:, 1].reshape(-1, 1)
+    valid_mask = np.isfinite(raw_scores_val.ravel())
+    if valid_mask.sum() < 10 or len(np.unique(y_val[valid_mask])) < 2:
+        # Not enough valid data to calibrate — return raw probabilities
+        print("[calibration] Skipping calibration: insufficient valid predictions")
+        return y_pred_proba_test
+
+    platt = LogisticRegression(max_iter=1000)
+    platt.fit(raw_scores_val[valid_mask], y_val[valid_mask])
+
+    # Apply to test set; fall back to raw if test scores also have NaNs
+    raw_scores_test = y_pred_proba_test[:, 1].reshape(-1, 1)
+    valid_test = np.isfinite(raw_scores_test.ravel())
+    if not valid_test.all():
+        print("[calibration] Skipping calibration: NaN predictions in test set")
+        return y_pred_proba_test
+
+    return platt.predict_proba(raw_scores_test)
 
 
 def _print_rv_metrics(label: str, m: dict) -> None:
@@ -210,10 +263,12 @@ def run_feature_ablation(
 def train(
     cfg: PipelineConfig,
     data_path: str | None = None,
-    train_lstm: bool = True,
     train_tcn: bool = True,
+    train_transformer: bool = False,
     train_garch: bool = True,
-    lstm_horizon_s: int = 5,
+    seq_horizon_s: int = 5,
+    seed: int = 42,
+    max_rows: int | None = None,
 ) -> dict:
     """
     Full training pipeline with MLflow tracking.
@@ -223,19 +278,25 @@ def train(
     cfg : PipelineConfig
     data_path : str | None
         For parquet source, the file path to load.
-    train_lstm : bool
-        Whether to train the LSTM.
     train_tcn : bool
         Whether to train the TCN.
     train_garch : bool
         Whether to fit the GARCH baseline.
-    lstm_horizon_s : int
-        Which horizon (seconds) to train the LSTM/TCN on.
+    seq_horizon_s : int
+        Which horizon (seconds) to train the TCN/Transformer on.
+    seed : int
+        Random seed for reproducibility (default 42).
 
     Returns
     -------
     dict with results
     """
+    # Set seeds for reproducibility
+    import torch
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    cfg.models.lgbm_params["seed"] = seed
+
     horizons = cfg.features.horizons
     tps      = cfg.features.ticks_per_second
 
@@ -249,6 +310,7 @@ def train(
         print(f"{'#' * 72}")
 
         mlflow.log_params({
+            "seed":            seed,
             "source":          cfg.data.source,
             "symbol":          cfg.data.symbol,
             "train_frac":      cfg.data.train_frac,
@@ -261,16 +323,8 @@ def train(
             "lgbm_n_estimators": cfg.models.lgbm_params.get("n_estimators"),
             "lgbm_lr":         cfg.models.lgbm_params.get("learning_rate"),
             "lgbm_num_leaves": cfg.models.lgbm_params.get("num_leaves"),
-            "lstm_enabled":    train_lstm,
             "tcn_enabled":     train_tcn,
             "garch_enabled":   train_garch,
-            "lstm_hidden":     cfg.models.lstm_hidden,
-            "lstm_layers":     cfg.models.lstm_layers,
-            "lstm_seq_len":    cfg.models.lstm_seq_len,
-            "lstm_epochs":     cfg.models.lstm_epochs,
-            "lstm_batch":      cfg.models.lstm_batch,
-            "lstm_rv_loss_weight": cfg.models.lstm_rv_loss_weight,
-            "lstm_patience":   cfg.models.lstm_patience,
         })
 
         # ─────────────────────────────────────────────────────────────────────
@@ -281,11 +335,12 @@ def train(
         loader = DataLoader(
             source=cfg.data.source,
             path=data_path,
+            csv_dir=str(cfg.data.csv_dir),
             pair=cfg.data.symbol,
             levels=cfg.data.lob_levels,
             poll_interval_s=0.5,
         )
-        raw_df    = loader.load(n_rows=5_000)
+        raw_df    = loader.load(n_rows=max_rows)
         load_time = time.perf_counter() - t0
 
         _log(f"Source:      {cfg.data.source}")
@@ -481,6 +536,7 @@ def train(
         lgbm_models:        dict[str, LGBMDualModel] = {}
         lgbm_rv_metrics:    dict[str, dict] = {}
         lgbm_shock_metrics: dict[str, dict] = {}
+        lgbm_shock_metrics_calib: dict[str, dict] = {}
         lgbm_rv_preds:      dict[str, np.ndarray] = {}
 
         for h in horizons:
@@ -496,15 +552,29 @@ def train(
             )
             rv_pred    = lgbm_h.predict_rv(splits.X_test)
             shk_proba  = lgbm_h.predict_shock_proba(splits.X_test)
+            shk_proba_val = lgbm_h.predict_shock_proba(splits.X_val)
+
+            # Calibrate shock probabilities using validation set
+            shk_proba_calib = calibrate_shock_probabilities(
+                splits.y_shock_spread[key]["val"],
+                shk_proba_val,
+                splits.y_shock_spread[key]["test"],
+                shk_proba
+            )
+
             lgbm_rv_metrics[key]    = evaluate_rv_forecast(splits.y_rv[key]["test"], rv_pred)
             lgbm_shock_metrics[key] = evaluate_shock_forecast(
                 splits.y_shock_spread[key]["test"], shk_proba
+            )
+            lgbm_shock_metrics_calib[key] = evaluate_shock_forecast(
+                splits.y_shock_spread[key]["test"], shk_proba_calib
             )
             lgbm_models[key]   = lgbm_h
             lgbm_rv_preds[key] = rv_pred
 
             _print_rv_metrics(f"LGBM RV ({key})",    lgbm_rv_metrics[key])
             _print_shock_metrics(f"LGBM Shock ({key})", lgbm_shock_metrics[key])
+            _print_shock_metrics(f"LGBM Shock Calib ({key})", lgbm_shock_metrics_calib[key])
             mlflow.log_metrics({
                 f"lgbm_{key}_rv_rmse":      lgbm_rv_metrics[key]["rmse"],
                 f"lgbm_{key}_rv_mae":       lgbm_rv_metrics[key]["mae"],
@@ -512,6 +582,9 @@ def train(
                 f"lgbm_{key}_shock_auroc":  lgbm_shock_metrics[key]["auroc"],
                 f"lgbm_{key}_shock_auprc":  lgbm_shock_metrics[key]["auprc"],
                 f"lgbm_{key}_shock_brier":  lgbm_shock_metrics[key]["brier"],
+                f"lgbm_{key}_shock_auroc_calib":  lgbm_shock_metrics_calib[key]["auroc"],
+                f"lgbm_{key}_shock_auprc_calib":  lgbm_shock_metrics_calib[key]["auprc"],
+                f"lgbm_{key}_shock_brier_calib":  lgbm_shock_metrics_calib[key]["brier"],
             })
 
         lgbm_time = time.perf_counter() - t0
@@ -519,7 +592,7 @@ def train(
         mlflow.log_metric("lgbm_fit_time", lgbm_time)
 
         # Top feature importances for primary horizon
-        primary_key = f"{lstm_horizon_s}s" if f"{lstm_horizon_s}s" in lgbm_models else f"{horizons[0]}s"
+        primary_key = f"{seq_horizon_s}s" if f"{seq_horizon_s}s" in lgbm_models else f"{horizons[0]}s"
         lgbm_primary = lgbm_models[primary_key]
         if hasattr(lgbm_primary.rv_model, "feature_importances_"):
             importances = lgbm_primary.rv_model.feature_importances_
@@ -529,89 +602,15 @@ def train(
                 _log(f"  {fname:<32} {imp:>8.1f}")
 
         # ─────────────────────────────────────────────────────────────────────
-        # 8. LSTM (optional, one horizon)
-        # ─────────────────────────────────────────────────────────────────────
-        lstm = None
-        lstm_rv_pred_test   = None
-        lstm_rv_metrics     = None
-        lstm_shock_metrics  = None
-        lstm_time           = None
-        lstm_key            = f"{lstm_horizon_s}s"
-
-        if train_lstm and lstm_key in splits.y_rv:
-            _section(f"8. LSTM Dual-Head Model ({lstm_key} horizon)")
-            _log(f"hidden={cfg.models.lstm_hidden}  layers={cfg.models.lstm_layers}  "
-                 f"seq_len={cfg.models.lstm_seq_len}  epochs={cfg.models.lstm_epochs}  "
-                 f"batch={cfg.models.lstm_batch}")
-            t0 = time.perf_counter()
-
-            lstm = DualHeadLSTM(
-                hidden_size=cfg.models.lstm_hidden,
-                num_layers=cfg.models.lstm_layers,
-                seq_len=cfg.models.lstm_seq_len,
-                epochs=cfg.models.lstm_epochs,
-                batch_size=cfg.models.lstm_batch,
-                rv_loss_weight=cfg.models.lstm_rv_loss_weight,
-                patience=cfg.models.lstm_patience,
-            )
-            _log(f"Device: {lstm.device}")
-
-            mlflow.end_run()
-            lstm.fit(
-                splits.X_train, splits.y_rv[lstm_key]["train"],
-                splits.y_shock_spread[lstm_key]["train"],
-                X_val=splits.X_val,
-                y_rv_val=splits.y_rv[lstm_key]["val"],
-                y_shock_val=splits.y_shock_spread[lstm_key]["val"],
-            )
-            mlflow.start_run(run_id=run_id)
-
-            lstm_time             = time.perf_counter() - t0
-            lstm_rv_pred_test     = lstm.predict_rv(splits.X_test)
-            lstm_shock_proba_test = lstm.predict_shock_proba(splits.X_test)
-            lstm_rv_metrics       = evaluate_rv_forecast(
-                splits.y_rv[lstm_key]["test"], lstm_rv_pred_test
-            )
-            lstm_shock_metrics = evaluate_shock_forecast(
-                splits.y_shock_spread[lstm_key]["test"], lstm_shock_proba_test
-            )
-
-            _print_rv_metrics(f"LSTM RV ({lstm_key})",    lstm_rv_metrics)
-            _print_shock_metrics(f"LSTM Shock ({lstm_key})", lstm_shock_metrics)
-            _log(f"Fit time: {lstm_time:.2f}s")
-
-            if lstm.train_history:
-                for entry in lstm.train_history:
-                    mlflow.log_metrics(
-                        {"lstm_train_loss": entry["train_loss"],
-                         **( {"lstm_val_loss": entry["val_loss"]}
-                             if "val_loss" in entry else {})},
-                        step=entry["epoch"],
-                    )
-
-            mlflow.log_metrics({
-                f"lstm_{lstm_key}_rv_rmse":     lstm_rv_metrics["rmse"],
-                f"lstm_{lstm_key}_rv_mae":      lstm_rv_metrics["mae"],
-                f"lstm_{lstm_key}_rv_qlike":    lstm_rv_metrics["qlike"],
-                f"lstm_{lstm_key}_shock_auroc": lstm_shock_metrics["auroc"],
-                f"lstm_{lstm_key}_shock_auprc": lstm_shock_metrics["auprc"],
-                f"lstm_{lstm_key}_shock_brier": lstm_shock_metrics["brier"],
-                "lstm_fit_time": lstm_time,
-            })
-        else:
-            _section("8. LSTM")
-            _log("Skipped (train_lstm=False or horizon not available)")
-
-        # ─────────────────────────────────────────────────────────────────────
-        # 9. TCN (optional, one horizon)
+        # 8. TCN (optional, one horizon)
         # ─────────────────────────────────────────────────────────────────────
         tcn = None
         tcn_rv_metrics    = None
         tcn_shock_metrics = None
-        tcn_key           = lstm_key
+        tcn_key           = f"{seq_horizon_s}s"
 
         if train_tcn and tcn_key in splits.y_rv:
-            _section(f"9. TCN Model ({tcn_key} horizon)")
+            _section(f"8. TCN Model ({tcn_key} horizon)")
             t0 = time.perf_counter()
 
             tcn = TCNModel(
@@ -637,25 +636,127 @@ def train(
             tcn_time           = time.perf_counter() - t0
             tcn_rv_pred_test   = tcn.predict_rv(splits.X_test)
             tcn_shock_proba    = tcn.predict_shock_proba(splits.X_test)
+            tcn_shock_proba_val = tcn.predict_shock_proba(splits.X_val)
+
+            # Calibrate shock probabilities using validation set
+            tcn_shock_proba_calib = calibrate_shock_probabilities(
+                splits.y_shock_spread[tcn_key]["val"],
+                tcn_shock_proba_val,
+                splits.y_shock_spread[tcn_key]["test"],
+                tcn_shock_proba
+            )
+
             tcn_rv_metrics     = evaluate_rv_forecast(
                 splits.y_rv[tcn_key]["test"], tcn_rv_pred_test
             )
             tcn_shock_metrics  = evaluate_shock_forecast(
                 splits.y_shock_spread[tcn_key]["test"], tcn_shock_proba
             )
+            tcn_shock_metrics_calib = evaluate_shock_forecast(
+                splits.y_shock_spread[tcn_key]["test"], tcn_shock_proba_calib
+            )
 
             _print_rv_metrics(f"TCN RV ({tcn_key})",    tcn_rv_metrics)
             _print_shock_metrics(f"TCN Shock ({tcn_key})", tcn_shock_metrics)
+            _print_shock_metrics(f"TCN Shock Calib ({tcn_key})", tcn_shock_metrics_calib)
             _log(f"Fit time: {tcn_time:.2f}s")
             mlflow.log_metrics({
                 f"tcn_{tcn_key}_rv_rmse":     tcn_rv_metrics["rmse"],
                 f"tcn_{tcn_key}_rv_qlike":    tcn_rv_metrics["qlike"],
                 f"tcn_{tcn_key}_shock_auroc": tcn_shock_metrics["auroc"],
+                f"tcn_{tcn_key}_shock_auprc": tcn_shock_metrics["auprc"],
+                f"tcn_{tcn_key}_shock_brier": tcn_shock_metrics["brier"],
+                f"tcn_{tcn_key}_shock_auroc_calib": tcn_shock_metrics_calib["auroc"],
+                f"tcn_{tcn_key}_shock_auprc_calib": tcn_shock_metrics_calib["auprc"],
+                f"tcn_{tcn_key}_shock_brier_calib": tcn_shock_metrics_calib["brier"],
                 "tcn_fit_time": tcn_time,
             })
         else:
-            _section("9. TCN")
+            _section("8. TCN")
             _log("Skipped (train_tcn=False or horizon not available)")
+
+        # ─────────────────────────────────────────────────────────────────────
+        # 9. Transformer (optional, one horizon)
+        # ─────────────────────────────────────────────────────────────────────
+        transformer = None
+        transformer_rv_metrics    = None
+        transformer_shock_metrics = None
+        transformer_key           = tcn_key
+
+        if train_transformer and transformer_key in splits.y_rv:
+            _section(f"9. Transformer Model ({transformer_key} horizon)")
+            t0 = time.perf_counter()
+
+            transformer = TransformerModel(
+                d_model=cfg.models.transformer_d_model,
+                nhead=cfg.models.transformer_nhead,
+                num_layers=cfg.models.transformer_num_layers,
+                dim_feedforward=cfg.models.transformer_dim_feedforward,
+                dropout=cfg.models.transformer_dropout,
+                seq_len=cfg.models.transformer_seq_len,
+                epochs=cfg.models.transformer_epochs,
+                batch_size=cfg.models.transformer_batch,
+            )
+            _log(f"Device: {transformer.device}")
+
+            mlflow.end_run()
+            transformer.fit(
+                splits.X_train, splits.y_rv[transformer_key]["train"],
+                splits.y_shock_spread[transformer_key]["train"],
+                X_val=splits.X_val,
+                y_rv_val=splits.y_rv[transformer_key]["val"],
+                y_shock_val=splits.y_shock_spread[transformer_key]["val"],
+            )
+            mlflow.start_run(run_id=run_id)
+
+            transformer_time           = time.perf_counter() - t0
+            transformer_rv_pred_test   = transformer.predict_rv(splits.X_test)
+            transformer_shock_proba    = transformer.predict_shock_proba(splits.X_test)
+            transformer_shock_proba_val = transformer.predict_shock_proba(splits.X_val)
+
+            transformer_shock_proba_calib = calibrate_shock_probabilities(
+                splits.y_shock_spread[transformer_key]["val"],
+                transformer_shock_proba_val,
+                splits.y_shock_spread[transformer_key]["test"],
+                transformer_shock_proba,
+            )
+
+            transformer_rv_metrics    = evaluate_rv_forecast(
+                splits.y_rv[transformer_key]["test"], transformer_rv_pred_test
+            )
+            transformer_shock_metrics = evaluate_shock_forecast(
+                splits.y_shock_spread[transformer_key]["test"], transformer_shock_proba
+            )
+            transformer_shock_metrics_calib = evaluate_shock_forecast(
+                splits.y_shock_spread[transformer_key]["test"], transformer_shock_proba_calib
+            )
+
+            _print_rv_metrics(f"Transformer RV ({transformer_key})",    transformer_rv_metrics)
+            _print_shock_metrics(f"Transformer Shock ({transformer_key})", transformer_shock_metrics)
+            _print_shock_metrics(f"Transformer Shock Calib ({transformer_key})", transformer_shock_metrics_calib)
+            _log(f"Fit time: {transformer_time:.2f}s")
+            mlflow.log_metrics({
+                f"transformer_{transformer_key}_rv_rmse":          transformer_rv_metrics["rmse"],
+                f"transformer_{transformer_key}_rv_qlike":         transformer_rv_metrics["qlike"],
+                f"transformer_{transformer_key}_shock_auroc":      transformer_shock_metrics["auroc"],
+                f"transformer_{transformer_key}_shock_auprc":      transformer_shock_metrics["auprc"],
+                f"transformer_{transformer_key}_shock_brier":      transformer_shock_metrics["brier"],
+                f"transformer_{transformer_key}_shock_auroc_calib": transformer_shock_metrics_calib["auroc"],
+                f"transformer_{transformer_key}_shock_auprc_calib": transformer_shock_metrics_calib["auprc"],
+                f"transformer_{transformer_key}_shock_brier_calib": transformer_shock_metrics_calib["brier"],
+                "transformer_fit_time": transformer_time,
+            })
+
+            if transformer is not None:
+                path = Path("models") / "transformer_model.pkl"
+                import pickle
+                with open(path, "wb") as f:
+                    pickle.dump(transformer, f)
+                mlflow.log_artifact(str(path))
+                _log(f"Saved {path}")
+        else:
+            _section("9. Transformer")
+            _log("Skipped (train_transformer=False or horizon not available)")
 
         # ─────────────────────────────────────────────────────────────────────
         # 10. Regime-based evaluation
@@ -717,7 +818,7 @@ def train(
             _log("Skipped (primary horizon not in splits)")
 
         # ─────────────────────────────────────────────────────────────────────
-        # 12. Diebold-Mariano tests (primary horizon)
+        # 13. Diebold-Mariano tests (primary horizon)
         # ─────────────────────────────────────────────────────────────────────
         _section("12. Diebold-Mariano Tests")
         _log(f"Horizon: {primary_key}   H0: equal forecast accuracy   p<0.05 → reject")
@@ -742,16 +843,6 @@ def train(
                                                lgbm_rv_preds[primary_key])
             _print_dm("LGBM vs GARCH", dm_lgbm_vs_garch)
             dm_results["lgbm_vs_garch"] = dm_lgbm_vs_garch
-
-        if lstm_rv_pred_test is not None and lstm_key == primary_key:
-            dm_lstm_vs_har  = diebold_mariano(y_rv_te, har_pred_test[:len(y_rv_te)],
-                                              lstm_rv_pred_test[:len(y_rv_te)])
-            dm_lstm_vs_lgbm = diebold_mariano(y_rv_te, lgbm_rv_preds[primary_key],
-                                              lstm_rv_pred_test[:len(y_rv_te)])
-            _print_dm("LSTM vs HAR",  dm_lstm_vs_har)
-            _print_dm("LSTM vs LGBM", dm_lstm_vs_lgbm)
-            dm_results["lstm_vs_har"]  = dm_lstm_vs_har
-            dm_results["lstm_vs_lgbm"] = dm_lstm_vs_lgbm
 
         if tcn is not None and tcn_key == primary_key:
             tcn_rv_pred_test_prim = tcn.predict_rv(splits.X_test)
@@ -791,13 +882,6 @@ def train(
         with open(path_legacy, "wb") as f:
             pickle.dump(lgbm_models[primary_key], f)
 
-        if lstm is not None:
-            path = models_dir / "lstm_model.pkl"
-            with open(path, "wb") as f:
-                pickle.dump(lstm, f)
-            mlflow.log_artifact(str(path))
-            _log(f"Saved {path}")
-
         if tcn is not None:
             path = models_dir / "tcn_model.pkl"
             with open(path, "wb") as f:
@@ -817,9 +901,6 @@ def train(
                 "lgbm_rv":    lgbm_rv_metrics.get(key, {}),
                 "lgbm_shock": lgbm_shock_metrics.get(key, {}),
             }
-            if lstm_rv_metrics is not None and key == lstm_key:
-                per_horizon[key]["lstm_rv"]    = lstm_rv_metrics
-                per_horizon[key]["lstm_shock"] = lstm_shock_metrics
             if tcn_rv_metrics is not None and key == tcn_key:
                 per_horizon[key]["tcn_rv"]    = tcn_rv_metrics
                 per_horizon[key]["tcn_shock"] = tcn_shock_metrics
@@ -847,12 +928,6 @@ def train(
             "auprc":     float(lgbm_shock_metrics[primary_key]["auprc"]),
             "brier":     float(lgbm_shock_metrics[primary_key]["brier"]),
         }
-        if lstm_rv_metrics is not None:
-            results["lstm_rmse"]  = float(lstm_rv_metrics["rmse"])
-            results["lstm_auroc"] = float(lstm_shock_metrics["auroc"])
-            results["lstm_auprc"] = float(lstm_shock_metrics["auprc"])
-            results["lstm_brier"] = float(lstm_shock_metrics["brier"])
-
         if tcn_rv_metrics is not None:
             results["tcn_rmse"]  = float(tcn_rv_metrics["rmse"])
             results["tcn_auroc"] = float(tcn_shock_metrics["auroc"])
@@ -886,16 +961,6 @@ def train(
                      f"{m.get('qlike',float('nan')):>8.4f}  "
                      f"{sh.get('auroc', float('nan')):>8.4f}  "
                      f"{sh.get('auprc', float('nan')):>8.4f}")
-            if "lstm_rv" in ph:
-                m  = ph["lstm_rv"]
-                sh = ph.get("lstm_shock", {})
-                _log(f"{key:<8} {'LSTM':<12}  "
-                     f"{m.get('rmse', float('nan')):>10.6f}  "
-                     f"{m.get('mae',  float('nan')):>10.6f}  "
-                     f"{m.get('qlike',float('nan')):>8.4f}  "
-                     f"{sh.get('auroc', float('nan')):>8.4f}  "
-                     f"{sh.get('auprc', float('nan')):>8.4f}")
-
         _log("")
         _log(f"MLflow run ID: {run_id}")
         _log("View UI:       mlflow ui")
@@ -909,16 +974,18 @@ def train(
 
 def main():
     parser = argparse.ArgumentParser(description="Train volatility forecasting models")
-    parser.add_argument("--source",         required=True, choices=["parquet", "kraken"])
+    parser.add_argument("--source",         required=True, choices=["parquet", "csv", "kraken"])
     parser.add_argument("--path",           type=str,   default=None)
     parser.add_argument("--pair",           type=str,   default="XBTUSD")
-    parser.add_argument("--no-lstm",        action="store_true", help="Skip LSTM training")
     parser.add_argument("--tcn",            action="store_true", help="Train TCN model")
+    parser.add_argument("--transformer",    action="store_true", help="Train Transformer model")
     parser.add_argument("--no-garch",       action="store_true", help="Skip GARCH baseline")
     parser.add_argument("--horizons",       nargs="+", type=int, default=[1, 5, 30],
                         help="Forecast horizons in seconds (default: 1 5 30)")
-    parser.add_argument("--lstm-horizon",   type=int,   default=5,
-                        help="Horizon (s) for LSTM/TCN (default: 5)")
+    parser.add_argument("--seq-horizon",    type=int,   default=5,
+                        help="Horizon (s) for TCN/Transformer (default: 5)")
+    parser.add_argument("--max-rows",       type=int,   default=None,
+                        help="Max rows to load (default: all)")
     args = parser.parse_args()
 
     cfg = PipelineConfig()
@@ -931,10 +998,11 @@ def main():
         results = train(
             cfg,
             data_path=args.path,
-            train_lstm=not args.no_lstm,
             train_tcn=args.tcn,
+            train_transformer=args.transformer,
             train_garch=not args.no_garch,
-            lstm_horizon_s=args.lstm_horizon,
+            seq_horizon_s=args.seq_horizon,
+            max_rows=args.max_rows,
         )
         print("\n✓ Training completed successfully")
         print(json.dumps(results, indent=2))

@@ -150,8 +150,10 @@ def collect_kraken_snapshots(
     df = df.with_columns(pl.col("timestamp_ns").cast(pl.Int64))
 
     # Ensure depth_ratio column expected by FEATURE_COLS
-    bid_depth = sum(pl.col(f"bid_q{i}") for i in range(levels))
-    ask_depth = sum(pl.col(f"ask_q{i}") for i in range(levels))
+    bid_qty_cols = [f"bid_q{i}" for i in range(levels)]
+    ask_qty_cols = [f"ask_q{i}" for i in range(levels)]
+    bid_depth = pl.sum_horizontal(bid_qty_cols)
+    ask_depth = pl.sum_horizontal(ask_qty_cols)
     df = df.with_columns(
         (bid_depth / (ask_depth + 1e-9)).alias("depth_ratio")
     )
