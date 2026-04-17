@@ -2,7 +2,6 @@
 Deep sequence models for volatility forecasting.
 
 Implements:
-- _PositiveOutput       : smooth positive activation (Softplus)
 - _SequenceDataset      : lazy sliding-window dataset
 - _SequenceModel        : shared training loop (TCN, Transformer)
 - _get_device           : best-available device selection
@@ -32,17 +31,6 @@ def _get_device(device_str: str | None = None) -> torch.device:
         return torch.device("mps")
     return torch.device("cpu")
 
-
-class _PositiveOutput(nn.Module):
-    """Smooth positive activation via scaled Softplus. Preserves gradients, no hard floor."""
-
-    def __init__(self, min_value: float = 1e-5):
-        super().__init__()
-        self.min_value = min_value
-        self.softplus = nn.Softplus(beta=2.0)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.softplus(x) + self.min_value
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -171,6 +159,10 @@ class _SequenceModel:
         rv_preds_valid    = np.concatenate(rv_out)
         shock_proba_valid = np.concatenate(shock_out)
 
+        # Invert log-scaling applied during training
+        rv_log_shift = getattr(self, "_rv_log_shift", 0.0)
+        rv_preds_valid = np.exp(rv_preds_valid + rv_log_shift)
+
         rv_preds = np.empty(n)
         rv_preds[:self.seq_len] = rv_preds_valid[0]
         rv_preds[self.seq_len:] = rv_preds_valid
@@ -200,6 +192,14 @@ class _SequenceModel:
         X_train_s = self.scaler.fit_transform(X_train)
         X_val_s   = self.scaler.transform(X_val) if X_val is not None else None
 
+        # Log-scale RV targets so MSE loss operates on ~O(1) values instead of ~1e-10.
+        # Store the scale shift so predict_rv can invert it.
+        rv_eps = 1e-8
+        self._rv_log_shift = float(np.log(np.clip(y_rv_train, rv_eps, None)).mean())
+        y_rv_train_s = np.log(np.clip(y_rv_train, rv_eps, None)) - self._rv_log_shift
+        y_rv_val_s   = (np.log(np.clip(y_rv_val,   rv_eps, None)) - self._rv_log_shift
+                        if y_rv_val is not None else None)
+
         if len(X_train_s) <= self.seq_len:
             print(f"[{model_tag}] Not enough data to build sequences, skipping")
             return
@@ -209,11 +209,11 @@ class _SequenceModel:
               f"{sum(p.numel() for p in self.net.parameters()):,}  Starting training...")
 
         val_loader = None
-        if X_val_s is not None and y_rv_val is not None and y_shock_val is not None:
+        if X_val_s is not None and y_rv_val_s is not None and y_shock_val is not None:
             if len(X_val_s) > self.seq_len:
-                val_loader = self._make_loader(X_val_s, y_rv_val, y_shock_val, shuffle=False)
+                val_loader = self._make_loader(X_val_s, y_rv_val_s, y_shock_val, shuffle=False)
 
-        train_loader    = self._make_loader(X_train_s, y_rv_train, y_shock_train, shuffle=True)
+        train_loader    = self._make_loader(X_train_s, y_rv_train_s, y_shock_train, shuffle=True)
         optimizer       = torch.optim.Adam(self.net.parameters(), lr=lr, weight_decay=1e-4)
         rv_criterion    = nn.MSELoss()
         shock_criterion = nn.CrossEntropyLoss()
@@ -319,7 +319,6 @@ class _TCNNet(nn.Module):
             in_ch = out_ch
         self.network        = nn.Sequential(*layers)
         self.rv_head_linear = nn.Linear(channels[-1], 1)
-        self.rv_head        = _PositiveOutput(min_value=1e-5)
         self.shock_head     = nn.Sequential(
             nn.Linear(channels[-1], 16), nn.ReLU(), nn.Linear(16, 2)
         )
@@ -327,7 +326,7 @@ class _TCNNet(nn.Module):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         out  = self.network(x.transpose(1, 2))   # (B, T, F) → (B, C, T)
         last = out[:, :, -1]                      # (B, C)
-        rv_pred = self.rv_head(self.rv_head_linear(last))
+        rv_pred = self.rv_head_linear(last)                       # log-RV (B, 1)
         return rv_pred, self.shock_head(last)
 
     @staticmethod
@@ -461,8 +460,9 @@ class _TransformerNet(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
+        # RV head predicts log-RV (targets are log-scaled in _fit_loop); no
+        # positive activation needed since _predict_raw applies exp() to invert.
         self.rv_head_linear = nn.Linear(d_model, 1)
-        self.rv_head        = _PositiveOutput(min_value=1e-5)
         self.shock_head     = nn.Sequential(
             nn.Linear(d_model, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, 2)
         )
@@ -481,16 +481,18 @@ class _TransformerNet(nn.Module):
         # Project input features to model dimension
         x = self.input_proj(x)                                    # (B, T, d_model)
 
-        # Prepend CLS token
-        cls = self.cls_token.expand(B, -1, -1)                    # (B, 1, d_model)
-        x   = torch.cat([cls, x], dim=1)                          # (B, T+1, d_model)
+        # Add positional embeddings to input sequence (positions 0..T-1)
+        positions = torch.arange(T, device=x.device)
+        x = x + self.pos_emb(positions)                           # (B, T, d_model)
 
-        # Add positional embeddings
-        positions = torch.arange(T + 1, device=x.device)
-        x = x + self.pos_emb(positions)                           # (B, T+1, d_model)
+        # Append CLS token at the end so it attends to the full sequence
+        # Position T is reserved for CLS in pos_emb (Embedding has seq_len+1 rows)
+        cls_pos = torch.tensor([T], device=x.device)
+        cls = self.cls_token.expand(B, -1, -1) + self.pos_emb(cls_pos)  # (B, 1, d_model)
+        x   = torch.cat([x, cls], dim=1)                          # (B, T+1, d_model)
 
-        # Causal mask: position i cannot attend to position j > i
-        # Shape (T+1, T+1); True means "ignore this position"
+        # Causal mask: position i cannot attend to position j > i.
+        # CLS is at T, so it attends to all T prior positions (correct).
         mask = torch.triu(
             torch.ones(T + 1, T + 1, device=x.device, dtype=torch.bool), diagonal=1
         )
@@ -498,10 +500,10 @@ class _TransformerNet(nn.Module):
         # Encode
         out = self.encoder(x, mask=mask, is_causal=True)          # (B, T+1, d_model)
 
-        # Read off CLS token (position 0) for prediction
-        cls_out = out[:, 0, :]                                     # (B, d_model)
+        # Read off CLS token (last position) for prediction
+        cls_out = out[:, -1, :]                                    # (B, d_model)
 
-        rv_pred = self.rv_head(self.rv_head_linear(cls_out))
+        rv_pred = self.rv_head_linear(cls_out)                    # log-RV (B, 1)
         return rv_pred, self.shock_head(cls_out)
 
 

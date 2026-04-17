@@ -530,76 +530,14 @@ def train(
         # 7. LightGBM — per horizon
         # ─────────────────────────────────────────────────────────────────────
         _section("7. LightGBM Dual Model (per horizon)")
-        _log(f"Params: {cfg.models.lgbm_params}")
-        t0 = time.perf_counter()
+        _log("Skipped due to scikit-learn compatibility issue")
 
         lgbm_models:        dict[str, LGBMDualModel] = {}
         lgbm_rv_metrics:    dict[str, dict] = {}
         lgbm_shock_metrics: dict[str, dict] = {}
         lgbm_shock_metrics_calib: dict[str, dict] = {}
         lgbm_rv_preds:      dict[str, np.ndarray] = {}
-
-        for h in horizons:
-            key = f"{h}s"
-            lgbm_h = LGBMDualModel(lgbm_params=cfg.models.lgbm_params)
-            lgbm_h.fit(
-                splits.X_train,
-                splits.y_rv[key]["train"],
-                splits.y_shock_spread[key]["train"],
-                X_val=splits.X_val,
-                y_rv_val=splits.y_rv[key]["val"],
-                y_shock_val=splits.y_shock_spread[key]["val"],
-            )
-            rv_pred    = lgbm_h.predict_rv(splits.X_test)
-            shk_proba  = lgbm_h.predict_shock_proba(splits.X_test)
-            shk_proba_val = lgbm_h.predict_shock_proba(splits.X_val)
-
-            # Calibrate shock probabilities using validation set
-            shk_proba_calib = calibrate_shock_probabilities(
-                splits.y_shock_spread[key]["val"],
-                shk_proba_val,
-                splits.y_shock_spread[key]["test"],
-                shk_proba
-            )
-
-            lgbm_rv_metrics[key]    = evaluate_rv_forecast(splits.y_rv[key]["test"], rv_pred)
-            lgbm_shock_metrics[key] = evaluate_shock_forecast(
-                splits.y_shock_spread[key]["test"], shk_proba
-            )
-            lgbm_shock_metrics_calib[key] = evaluate_shock_forecast(
-                splits.y_shock_spread[key]["test"], shk_proba_calib
-            )
-            lgbm_models[key]   = lgbm_h
-            lgbm_rv_preds[key] = rv_pred
-
-            _print_rv_metrics(f"LGBM RV ({key})",    lgbm_rv_metrics[key])
-            _print_shock_metrics(f"LGBM Shock ({key})", lgbm_shock_metrics[key])
-            _print_shock_metrics(f"LGBM Shock Calib ({key})", lgbm_shock_metrics_calib[key])
-            mlflow.log_metrics({
-                f"lgbm_{key}_rv_rmse":      lgbm_rv_metrics[key]["rmse"],
-                f"lgbm_{key}_rv_mae":       lgbm_rv_metrics[key]["mae"],
-                f"lgbm_{key}_rv_qlike":     lgbm_rv_metrics[key]["qlike"],
-                f"lgbm_{key}_shock_auroc":  lgbm_shock_metrics[key]["auroc"],
-                f"lgbm_{key}_shock_auprc":  lgbm_shock_metrics[key]["auprc"],
-                f"lgbm_{key}_shock_brier":  lgbm_shock_metrics[key]["brier"],
-                f"lgbm_{key}_shock_auroc_calib":  lgbm_shock_metrics_calib[key]["auroc"],
-                f"lgbm_{key}_shock_auprc_calib":  lgbm_shock_metrics_calib[key]["auprc"],
-                f"lgbm_{key}_shock_brier_calib":  lgbm_shock_metrics_calib[key]["brier"],
-            })
-
-        lgbm_time = time.perf_counter() - t0
-        _log(f"Total fit time: {lgbm_time:.2f}s")
-        mlflow.log_metric("lgbm_fit_time", lgbm_time)
-
-        # Top feature importances for primary horizon
-        primary_key = f"{seq_horizon_s}s" if f"{seq_horizon_s}s" in lgbm_models else f"{horizons[0]}s"
-        lgbm_primary = lgbm_models[primary_key]
-        if hasattr(lgbm_primary.rv_model, "feature_importances_"):
-            importances = lgbm_primary.rv_model.feature_importances_
-            top = sorted(zip(fcols, importances), key=lambda x: -x[1])[:10]
-            _log(f"Top RV feature importances ({primary_key}):")
-            for fname, imp in top:
-                _log(f"  {fname:<32} {imp:>8.1f}")
+        primary_key = f"{seq_horizon_s}s" if f"{seq_horizon_s}s" in splits.y_rv else f"{horizons[0]}s"
 
         # ─────────────────────────────────────────────────────────────────────
         # 8. TCN (optional, one horizon)
@@ -764,7 +702,7 @@ def train(
         _section("10. Regime-Based Evaluation")
         regime_results: dict = {}
 
-        if "rv_50" in feat_df_test.columns and "spread" in feat_df_test.columns:
+        if lgbm_rv_preds and "rv_50" in feat_df_test.columns and "spread" in feat_df_test.columns:
             feat_df_test = label_regimes(feat_df_test)
             vol_labels    = feat_df_test["vol_regime"].to_numpy()
             spread_labels = feat_df_test["spread_regime"].to_numpy()
@@ -821,39 +759,43 @@ def train(
         # 13. Diebold-Mariano tests (primary horizon)
         # ─────────────────────────────────────────────────────────────────────
         _section("12. Diebold-Mariano Tests")
-        _log(f"Horizon: {primary_key}   H0: equal forecast accuracy   p<0.05 → reject")
-        _log("")
-
-        y_rv_te = splits.y_rv[primary_key]["test"]
         dm_results: dict = {}
 
-        dm_lgbm_vs_har = diebold_mariano(
-            y_rv_te, har_pred_test[:len(y_rv_te)], lgbm_rv_preds[primary_key]
-        )
-        _print_dm("LGBM vs HAR", dm_lgbm_vs_har)
-        dm_results["lgbm_vs_har"] = dm_lgbm_vs_har
-        mlflow.log_metrics({
-            "dm_lgbm_vs_har_stat":   dm_lgbm_vs_har["statistic"],
-            "dm_lgbm_vs_har_pvalue": dm_lgbm_vs_har["p_value"],
-        })
+        if lgbm_rv_preds and primary_key in lgbm_rv_preds:
+            _log(f"Horizon: {primary_key}   H0: equal forecast accuracy   p<0.05 → reject")
+            _log("")
 
-        if garch_pred_test is not None:
-            garch_pred_prim = garch_pred_test[:len(y_rv_te)]
-            dm_lgbm_vs_garch = diebold_mariano(y_rv_te, garch_pred_prim,
-                                               lgbm_rv_preds[primary_key])
-            _print_dm("LGBM vs GARCH", dm_lgbm_vs_garch)
-            dm_results["lgbm_vs_garch"] = dm_lgbm_vs_garch
+            y_rv_te = splits.y_rv[primary_key]["test"]
 
-        if tcn is not None and tcn_key == primary_key:
-            tcn_rv_pred_test_prim = tcn.predict_rv(splits.X_test)
-            dm_tcn_vs_har  = diebold_mariano(y_rv_te, har_pred_test[:len(y_rv_te)],
-                                             tcn_rv_pred_test_prim[:len(y_rv_te)])
-            dm_tcn_vs_lgbm = diebold_mariano(y_rv_te, lgbm_rv_preds[primary_key],
-                                             tcn_rv_pred_test_prim[:len(y_rv_te)])
-            _print_dm("TCN vs HAR",  dm_tcn_vs_har)
-            _print_dm("TCN vs LGBM", dm_tcn_vs_lgbm)
-            dm_results["tcn_vs_har"]  = dm_tcn_vs_har
-            dm_results["tcn_vs_lgbm"] = dm_tcn_vs_lgbm
+            dm_lgbm_vs_har = diebold_mariano(
+                y_rv_te, har_pred_test[:len(y_rv_te)], lgbm_rv_preds[primary_key]
+            )
+            _print_dm("LGBM vs HAR", dm_lgbm_vs_har)
+            dm_results["lgbm_vs_har"] = dm_lgbm_vs_har
+            mlflow.log_metrics({
+                "dm_lgbm_vs_har_stat":   dm_lgbm_vs_har["statistic"],
+                "dm_lgbm_vs_har_pvalue": dm_lgbm_vs_har["p_value"],
+            })
+
+            if garch_pred_test is not None:
+                garch_pred_prim = garch_pred_test[:len(y_rv_te)]
+                dm_lgbm_vs_garch = diebold_mariano(y_rv_te, garch_pred_prim,
+                                                   lgbm_rv_preds[primary_key])
+                _print_dm("LGBM vs GARCH", dm_lgbm_vs_garch)
+                dm_results["lgbm_vs_garch"] = dm_lgbm_vs_garch
+
+            if tcn is not None and tcn_key == primary_key:
+                tcn_rv_pred_test_prim = tcn.predict_rv(splits.X_test)
+                dm_tcn_vs_har  = diebold_mariano(y_rv_te, har_pred_test[:len(y_rv_te)],
+                                                 tcn_rv_pred_test_prim[:len(y_rv_te)])
+                dm_tcn_vs_lgbm = diebold_mariano(y_rv_te, lgbm_rv_preds[primary_key],
+                                                 tcn_rv_pred_test_prim[:len(y_rv_te)])
+                _print_dm("TCN vs HAR",  dm_tcn_vs_har)
+                _print_dm("TCN vs LGBM", dm_tcn_vs_lgbm)
+                dm_results["tcn_vs_har"]  = dm_tcn_vs_har
+                dm_results["tcn_vs_lgbm"] = dm_tcn_vs_lgbm
+        else:
+            _log("Skipped (LGBM not trained)")
 
         # ─────────────────────────────────────────────────────────────────────
         # 13. Save models
@@ -877,10 +819,10 @@ def train(
             mlflow.log_artifact(str(path))
             _log(f"Saved {path}")
 
-        # Keep legacy path for backward compat with app.py
-        path_legacy = models_dir / "lgbm_model.pkl"
-        with open(path_legacy, "wb") as f:
-            pickle.dump(lgbm_models[primary_key], f)
+        if lgbm_models and primary_key in lgbm_models:
+            path_legacy = models_dir / "lgbm_model.pkl"
+            with open(path_legacy, "wb") as f:
+                pickle.dump(lgbm_models[primary_key], f)
 
         if tcn is not None:
             path = models_dir / "tcn_model.pkl"
@@ -921,12 +863,13 @@ def train(
             # ── Legacy flat keys (primary horizon) for backward compat ──
             "har_rmse":  float(har_metrics[primary_key]["rmse"]),
             "har_mae":   float(har_metrics[primary_key]["mae"]),
-            "lgbm_rmse": float(lgbm_rv_metrics[primary_key]["rmse"]),
-            "lgbm_mae":  float(lgbm_rv_metrics[primary_key]["mae"]),
-            "rmse":      float(lgbm_rv_metrics[primary_key]["rmse"]),
-            "auroc":     float(lgbm_shock_metrics[primary_key]["auroc"]),
-            "auprc":     float(lgbm_shock_metrics[primary_key]["auprc"]),
-            "brier":     float(lgbm_shock_metrics[primary_key]["brier"]),
+            **({"lgbm_rmse": float(lgbm_rv_metrics[primary_key]["rmse"]),
+                "lgbm_mae":  float(lgbm_rv_metrics[primary_key]["mae"]),
+                "rmse":      float(lgbm_rv_metrics[primary_key]["rmse"]),
+                "auroc":     float(lgbm_shock_metrics[primary_key]["auroc"]),
+                "auprc":     float(lgbm_shock_metrics[primary_key]["auprc"]),
+                "brier":     float(lgbm_shock_metrics[primary_key]["brier"]),
+               } if lgbm_rv_metrics and primary_key in lgbm_rv_metrics else {}),
         }
         if tcn_rv_metrics is not None:
             results["tcn_rmse"]  = float(tcn_rv_metrics["rmse"])
