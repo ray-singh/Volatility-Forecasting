@@ -1,11 +1,84 @@
-# Volatility & Liquidity Forecasting from Limit Order Book (LOB) Data
+# Volatility & Liquidity Forecasting from Limit Order Book Data
 
-This project develops an end-to-end market microstructure research pipeline for forecasting short-horizon volatility and liquidity shocks using Level-2 (L2) limit order book data. The system reconstructs the full limit order book from raw exchange message data and generates a high-resolution representation of supply–demand dynamics at the top K price levels.
+An end-to-end market microstructure research pipeline for forecasting short-horizon realized volatility and liquidity shocks using Level-2 (L2) limit order book data. Built on 5.5M rows of BTC/USD tick data with 5 LOB levels.
 
-The project formulates both regression and classification tasks to capture different aspects of short-term market behavior. Regression targets include forward realized volatility over multiple horizons (e.g., 1s, 5s, 30s), while classification targets focus on discrete liquidity events such as bid–ask spread expansions and sudden depth depletion. Labels are constructed using strictly forward-looking windows to avoid information leakage.
+## What it does
 
-The modeling framework combines classical econometric approaches with modern machine learning techniques. Baseline models include HAR-RV and GARCH-type volatility models, while machine learning approaches such as LightGBM and sequence models (e.g: LSTM or temporal convolutional networks) are used to capture nonlinear and temporal dependencies in high-frequency data. Model performance is evaluated using time-based splits to reflect realistic deployment conditions and to account for distributional shift in market microstructure.
+- **Regression**: forecasts forward realized volatility at 1s, 5s, and 30s horizons
+- **Classification**: detects liquidity shocks — bid-ask spread expansions and depth depletions
+- **Live feed**: streams real-time LOB snapshots from Kraken/Bybit WebSocket APIs
+- **Dashboard**: Streamlit app with feature analysis, model comparison, and live inference
 
-The pipeline is implemented in Python using scalable data processing tools such as Polars and PyArrow, with PyTorch and LightGBM for modeling and MLflow for experiment tracking and reproducibility. Additional analysis includes feature ablation, regime-based evaluation (e.g: volatility and spread regimes), and robustness checks across prediction horizons.
+## Models
 
-The final system serves as a reproducible research platform for high-frequency market analysis, emphasizing careful data engineering, statistically sound evaluation, and practical considerations such as non-stationarity and microstructure-driven signal decay.
+| Model | Type | Notes |
+|---|---|---|
+| HAR-RV | Econometric baseline | Heterogeneous autoregressive realized volatility |
+| GARCH | Econometric baseline | Volatility clustering baseline |
+| LightGBM | ML | Regression (RV) + classification (shock) |
+| TCN | Deep learning | Temporal Convolutional Network, PyTorch |
+| Transformer | Deep learning | Self-attention sequence model, PyTorch |
+
+## Results (5s horizon)
+
+| Model | RMSE | AUROC |
+|---|---|---|
+| HAR-RV | 6.99e-05 | — |
+| GARCH | 7.80e-05 | — |
+| LightGBM | 6.70e-05 | 0.843 |
+
+*TCN and Transformer metrics populated after running `evaluate_deep.py`.*
+
+## Project structure
+
+```
+├── config.py           # PipelineConfig (horizons, fractions, LOB levels)
+├── engineer.py         # Feature engineering (RV, OFI, spread, depth, HAR lags)
+├── dataset.py          # Train/val/test splits (70/15/15 chronological)
+├── models.py           # LightGBM wrapper + DataLoader
+├── deep_models.py      # TCN and Transformer (PyTorch)
+├── train.py            # Full training pipeline + MLflow logging
+├── evaluate_deep.py    # Post-hoc evaluation of saved deep model pkl files
+├── app.py              # Streamlit dashboard
+├── kraken_feed.py      # Kraken WebSocket live feed
+├── bybit.py            # Bybit WebSocket live feed
+├── make_parquet.py     # Convert raw CSVs to parquet
+├── convert_data.py     # Data format utilities
+├── models/             # Saved model pkl files
+├── data/orderbook/     # Training data (btcusd_full.parquet, 5.5M rows)
+└── results.json        # Evaluation metrics (patched by train.py / evaluate_deep.py)
+```
+
+## Quickstart
+
+```bash
+python -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+
+# Train all models
+python train.py --source parquet --path data/orderbook/btcusd_full.parquet
+
+# Evaluate saved deep models without retraining
+python evaluate_deep.py
+
+# Launch dashboard
+streamlit run app.py
+```
+
+## Nightly retraining
+
+A launchd plist (`com.volcast.retrain.plist`) schedules nightly retraining at 03:00:
+
+```bash
+cp com.volcast.retrain.plist ~/Library/LaunchAgents/
+launchctl load ~/Library/LaunchAgents/com.volcast.retrain.plist
+# Logs: tail -f /tmp/volcast_retrain.log
+```
+
+## Stack
+
+- **Data**: Polars, PyArrow
+- **ML**: LightGBM, PyTorch (MPS/CUDA/CPU)
+- **Tracking**: MLflow
+- **Dashboard**: Streamlit
+- **Live data**: Kraken & Bybit WebSocket APIs

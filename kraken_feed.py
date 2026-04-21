@@ -347,6 +347,146 @@ def collect_kraken_ws_snapshots(
 
 
 # ---------------------------------------------------------------------------
+# Continuous background stream (for Streamlit live page)
+# ---------------------------------------------------------------------------
+
+class KrakenWSStream:
+    """
+    Long-lived WebSocket stream that appends LOB rows to a deque.
+
+    Designed for Streamlit: call start() once (idempotent), then read
+    .snapshot_deque from the UI thread at any time.
+
+    Usage
+    -----
+    stream = KrakenWSStream(pair="XBTUSD", levels=5)
+    stream.start()
+    rows = list(stream.snapshot_deque)   # latest up to maxlen rows
+    stream.stop()
+    """
+
+    def __init__(
+        self,
+        pair: str = "XBTUSD",
+        levels: int = 5,
+        maxlen: int = 600,
+        persist_path: str | None = "data/live_buffer.parquet",
+        flush_every: int = 100,
+    ):
+        from collections import deque
+        import threading
+        self.pair   = pair
+        self.levels = levels
+        self.symbol = _WS_SYMBOL_MAP.get(pair, pair.replace("USD", "/USD"))
+        self.snapshot_deque: deque = deque(maxlen=maxlen)
+        self._stop_event   = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._persist_path    = persist_path
+        self._flush_every     = flush_every
+        self._unflushed: list[dict] = []
+        self._flush_lock      = threading.Lock()
+        self._rows_persisted  = 0
+
+    def start(self):
+        """Start background thread (idempotent — safe to call multiple times)."""
+        import threading
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True, name="kraken-ws-stream")
+        self._thread.start()
+
+    def stop(self):
+        self._stop_event.set()
+
+    @property
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def rows_persisted(self) -> int:
+        """Total rows written to the parquet buffer so far."""
+        return self._rows_persisted
+
+    def _flush(self):
+        """Append unflushed rows to the parquet buffer (thread-safe)."""
+        import pathlib
+        with self._flush_lock:
+            if not self._unflushed:
+                return
+            batch = self._unflushed[:]
+            self._unflushed.clear()
+
+        new_df = pl.DataFrame(batch).with_columns(pl.col("timestamp_ns").cast(pl.Int64))
+        path = pathlib.Path(self._persist_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        if path.exists():
+            existing = pl.read_parquet(path)
+            combined = pl.concat([existing, new_df], how="diagonal")
+        else:
+            combined = new_df
+
+        combined.write_parquet(path)
+        self._rows_persisted = len(combined)
+        print(f"[KrakenWSStream] flushed {len(batch)} rows → {path} "
+              f"(total {self._rows_persisted:,})")
+
+    def _run(self):
+        import asyncio
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._stream())
+        finally:
+            loop.close()
+
+    async def _stream(self):
+        import websockets
+        subscribe_msg = json.dumps({
+            "method": "subscribe",
+            "params": {
+                "channel": "book",
+                "symbol": [self.symbol],
+                "depth":  max(self.levels, 10),
+            },
+        })
+        bids: dict[float, float] = {}
+        asks: dict[float, float] = {}
+
+        while not self._stop_event.is_set():
+            try:
+                async with websockets.connect(_KRAKEN_WS_URL, ping_interval=20) as ws:
+                    await ws.send(subscribe_msg)
+                    while not self._stop_event.is_set():
+                        try:
+                            raw = await asyncio.wait_for(ws.recv(), timeout=5.0)
+                        except asyncio.TimeoutError:
+                            continue
+                        msg = json.loads(raw)
+                        if msg.get("channel") != "book":
+                            continue
+                        for entry in msg.get("data", []):
+                            _apply_book_delta(bids, asks, entry)
+                        if msg.get("type") in ("snapshot", "update"):
+                            row = _book_to_row(bids, asks, self.levels)
+                            if row is not None:
+                                self.snapshot_deque.append(row)
+                                if self._persist_path:
+                                    with self._flush_lock:
+                                        self._unflushed.append(row)
+                                    if len(self._unflushed) >= self._flush_every:
+                                        self._flush()
+            except Exception as exc:
+                if not self._stop_event.is_set():
+                    print(f"[KrakenWSStream] reconnecting after error: {exc}")
+                    await asyncio.sleep(2.0)
+        # flush any remaining rows on clean stop
+        if self._persist_path and self._unflushed:
+            self._flush()
+
+
+# ---------------------------------------------------------------------------
 # CLI smoke-test:  python kraken_feed.py
 # ---------------------------------------------------------------------------
 

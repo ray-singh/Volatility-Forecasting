@@ -159,9 +159,10 @@ class _SequenceModel:
         rv_preds_valid    = np.concatenate(rv_out)
         shock_proba_valid = np.concatenate(shock_out)
 
-        # Invert log-scaling applied during training
+        # Invert log-scaling + standardization applied during training
         rv_log_shift = getattr(self, "_rv_log_shift", 0.0)
-        rv_preds_valid = np.exp(rv_preds_valid + rv_log_shift)
+        rv_log_std   = getattr(self, "_rv_log_std",   1.0)
+        rv_preds_valid = np.exp(rv_preds_valid * rv_log_std + rv_log_shift)
 
         rv_preds = np.empty(n)
         rv_preds[:self.seq_len] = rv_preds_valid[0]
@@ -192,13 +193,17 @@ class _SequenceModel:
         X_train_s = self.scaler.fit_transform(X_train)
         X_val_s   = self.scaler.transform(X_val) if X_val is not None else None
 
-        # Log-scale RV targets so MSE loss operates on ~O(1) values instead of ~1e-10.
-        # Store the scale shift so predict_rv can invert it.
+        # Log-scale + standardize RV targets so MSE operates on unit-variance values.
+        # Without standardization, log-RV std≈4.2 → init MSE≈18, very slow convergence.
         rv_eps = 1e-8
-        self._rv_log_shift = float(np.log(np.clip(y_rv_train, rv_eps, None)).mean())
-        y_rv_train_s = np.log(np.clip(y_rv_train, rv_eps, None)) - self._rv_log_shift
-        y_rv_val_s   = (np.log(np.clip(y_rv_val,   rv_eps, None)) - self._rv_log_shift
-                        if y_rv_val is not None else None)
+        log_rv_train = np.log(np.clip(y_rv_train, rv_eps, None))
+        self._rv_log_shift = float(log_rv_train.mean())
+        self._rv_log_std   = float(log_rv_train.std()) or 1.0
+        y_rv_train_s = (log_rv_train - self._rv_log_shift) / self._rv_log_std
+        y_rv_val_s   = (
+            (np.log(np.clip(y_rv_val, rv_eps, None)) - self._rv_log_shift) / self._rv_log_std
+            if y_rv_val is not None else None
+        )
 
         if len(X_train_s) <= self.seq_len:
             print(f"[{model_tag}] Not enough data to build sequences, skipping")
@@ -322,6 +327,10 @@ class _TCNNet(nn.Module):
         self.shock_head     = nn.Sequential(
             nn.Linear(channels[-1], 16), nn.ReLU(), nn.Linear(16, 2)
         )
+        nn.init.zeros_(self.rv_head_linear.weight)
+        nn.init.zeros_(self.rv_head_linear.bias)
+        nn.init.zeros_(self.shock_head[-1].weight)
+        nn.init.zeros_(self.shock_head[-1].bias)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         out  = self.network(x.transpose(1, 2))   # (B, T, F) → (B, C, T)
@@ -473,6 +482,12 @@ class _TransformerNet(nn.Module):
     def _init_weights(self):
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         nn.init.xavier_uniform_(self.input_proj.weight)
+        # Zero-init final classification layer so CE starts near ln(2) ≈ 0.69
+        nn.init.zeros_(self.shock_head[-1].weight)
+        nn.init.zeros_(self.shock_head[-1].bias)
+        # Zero-init RV head so log-RV prediction starts near 0 (= log_shift)
+        nn.init.zeros_(self.rv_head_linear.weight)
+        nn.init.zeros_(self.rv_head_linear.bias)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         # x: (B, T, F)

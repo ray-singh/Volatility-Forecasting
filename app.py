@@ -311,7 +311,7 @@ def badge(text: str, style: str = "dim") -> str:
 
 
 # ── Navigation ───────────────────────────────────────────────────────────────
-NAV_PAGES = ["Overview", "Order Book", "Features", "Models", "Data Collection"]
+NAV_PAGES = ["Features", "Models", "Live", "Data Collection"]
 
 def render_topbar():
     # Brand + nav as columns
@@ -331,7 +331,7 @@ def render_topbar():
 
     # Use session state for active page
     if "page" not in st.session_state:
-        st.session_state["page"] = "Overview"
+        st.session_state["page"] = "Live"
 
     for col, name in zip(nav_cols, NAV_PAGES):
         with col:
@@ -374,10 +374,14 @@ def page_overview(df, results):
         panels = [("Mid Price","—","",True),("Avg Spread","—","",True),
                   ("Snapshots","—","",True),("Duration","—","",True)]
 
-    # Add best RMSE KPI
+    # Add best RMSE KPI — pick best LGBM RMSE across horizons
     if results:
-        best_rmse = min(v for k, v in results.items() if "rmse" in k and isinstance(v, float))
-        panels.append(("Best RMSE (RV)", f"{best_rmse:.2e}", "LightGBM", True))
+        per_h = results.get("per_horizon") or {}
+        lgbm_rmses = [v["lgbm_rv"]["rmse"] for v in per_h.values()
+                      if "lgbm_rv" in v and "rmse" in v["lgbm_rv"]]
+        best_rmse = min(lgbm_rmses) if lgbm_rmses else results.get("lgbm_rmse") or results.get("rmse")
+        if best_rmse:
+            panels.append(("Best RMSE (LGBM)", f"{best_rmse:.2e}", "1s horizon", True))
 
     for col, (label, val, delta, pos) in zip([c1,c2,c3,c4,c5], panels):
         with col:
@@ -635,11 +639,35 @@ def page_features(df):
 # PAGE: MODELS
 # ══════════════════════════════════════════════════════════════════════════════
 def _render_results_table(results: dict):
+    # Pull 5s horizon (primary) from per_horizon if available, else fall back to flat legacy keys
+    ph5 = (results.get("per_horizon") or {}).get("5s", {})
+    har_rmse  = ph5.get("har",  {}).get("rmse")  or results.get("har_rmse")
+    har_mae   = ph5.get("har",  {}).get("mae")   or results.get("har_mae")
+    garch_rmse = ph5.get("garch", {}).get("rmse")
+    garch_mae  = ph5.get("garch", {}).get("mae")
+    lgbm_rmse = ph5.get("lgbm_rv",    {}).get("rmse") or results.get("lgbm_rmse")
+    lgbm_mae  = ph5.get("lgbm_rv",    {}).get("mae")  or results.get("lgbm_mae")
+    lgbm_auroc = ph5.get("lgbm_shock", {}).get("auroc") or results.get("auroc")
+    lgbm_auprc = ph5.get("lgbm_shock", {}).get("auprc") or results.get("auprc")
+    lgbm_brier = ph5.get("lgbm_shock", {}).get("brier") or results.get("brier")
+    tcn_rmse  = ph5.get("tcn_rv", {}).get("rmse") or results.get("tcn_rmse")
+    tcn_mae   = ph5.get("tcn_rv", {}).get("mae")
+    tcn_auroc = ph5.get("tcn_shock", {}).get("auroc") or results.get("tcn_auroc")
+    tcn_auprc = ph5.get("tcn_shock", {}).get("auprc") or results.get("tcn_auprc")
+    tcn_brier = ph5.get("tcn_shock", {}).get("brier") or results.get("tcn_brier")
+    tr_rmse   = ph5.get("transformer_rv", {}).get("rmse") or results.get("transformer_rmse")
+    tr_mae    = ph5.get("transformer_rv", {}).get("mae")
+    tr_auroc  = ph5.get("transformer_shock", {}).get("auroc") or results.get("transformer_auroc")
+    tr_auprc  = ph5.get("transformer_shock", {}).get("auprc") or results.get("transformer_auprc")
+    tr_brier  = ph5.get("transformer_shock", {}).get("brier") or results.get("transformer_brier")
     rows = [
-        ("HAR-RV",    results.get("har_rmse"),  results.get("har_mae"),  None,                   None,                    None),
-        ("LightGBM",  results.get("lgbm_rmse"), results.get("lgbm_mae"), results.get("auroc"),   results.get("auprc"),    results.get("brier")),
-        ("TCN",       results.get("tcn_rmse"),   None,                   results.get("tcn_auroc"),  results.get("tcn_auprc"),  results.get("tcn_brier")),
+        ("HAR-RV",      har_rmse,  har_mae,  None,       None,       None),
+        ("GARCH",       garch_rmse, garch_mae, None,      None,       None),
+        ("LightGBM",    lgbm_rmse, lgbm_mae, lgbm_auroc, lgbm_auprc, lgbm_brier),
+        ("TCN",         tcn_rmse,  tcn_mae,  tcn_auroc,  tcn_auprc,  tcn_brier),
+        ("Transformer", tr_rmse,   tr_mae,   tr_auroc,   tr_auprc,   tr_brier),
     ]
+    rows = [r for r in rows if any(v is not None for v in r[1:])]
 
     def _fmt(v, fmt=".5f"):
         return f"{v:{fmt}}" if v is not None else "—"
@@ -696,11 +724,11 @@ def _render_multi_horizon(results: dict):
     # ── RMSE by horizon grouped bar
     st.markdown('<div class="section-title">RV Forecast RMSE by Horizon</div>',
                 unsafe_allow_html=True)
-    model_keys   = [("HAR-RV",    "har",     "#ffd166"),
-                    ("GARCH",     "garch",   WARN),
-                    ("LightGBM",  "lgbm_rv", ACCENT),
-
-                    ("TCN",       "tcn_rv",  "#06d6a0")]
+    model_keys   = [("HAR-RV",      "har",            "#ffd166"),
+                    ("GARCH",       "garch",          WARN),
+                    ("LightGBM",    "lgbm_rv",        ACCENT),
+                    ("TCN",         "tcn_rv",         "#06d6a0"),
+                    ("Transformer", "transformer_rv",  ACCENT2)]
     fig = go.Figure()
     for label, key, color in model_keys:
         vals = [per_h[h].get(key, {}).get("rmse") for h in horizons]
@@ -722,8 +750,9 @@ def _render_multi_horizon(results: dict):
     # ── Shock AUROC by horizon
     st.markdown('<div class="section-title">Shock Detection AUROC by Horizon</div>',
                 unsafe_allow_html=True)
-    shock_keys = [("LightGBM", "lgbm_shock", ACCENT),
-                  ("TCN",      "tcn_shock",   "#06d6a0")]
+    shock_keys = [("LightGBM",    "lgbm_shock",        ACCENT),
+                  ("TCN",         "tcn_shock",         "#06d6a0"),
+                  ("Transformer", "transformer_shock",  ACCENT2)]
     fig2 = go.Figure()
     for label, key, color in shock_keys:
         vals = [per_h[h].get(key, {}).get("auroc") for h in horizons]
@@ -753,10 +782,11 @@ def _render_multi_horizon(results: dict):
     for h in horizons:
         ph = per_h[h]
         for label, rv_key, sh_key in [
-            ("HAR-RV",   "har",      None),
-            ("GARCH",    "garch",    None),
-            ("LGBM",     "lgbm_rv",  "lgbm_shock"),
-            ("TCN",      "tcn_rv",   "tcn_shock"),
+            ("HAR-RV",      "har",             None),
+            ("GARCH",       "garch",           None),
+            ("LGBM",        "lgbm_rv",         "lgbm_shock"),
+            ("TCN",         "tcn_rv",          "tcn_shock"),
+            ("Transformer", "transformer_rv",  "transformer_shock"),
         ]:
             rv  = ph.get(rv_key, {})
             sh  = ph.get(sh_key, {}) if sh_key else {}
@@ -914,15 +944,19 @@ def page_models(results):
         # ── RMSE comparison bar chart
         st.markdown('<div class="section-title">Regression Performance — RMSE</div>',
                     unsafe_allow_html=True)
+        ph5 = (results.get("per_horizon") or {}).get("5s", {})
         rmse_data = {
-            "HAR-RV":   results.get("har_rmse"),
-            "LightGBM": results.get("lgbm_rmse"),
-            "TCN":      results.get("tcn_rmse"),
+            "HAR-RV":      ph5.get("har",            {}).get("rmse") or results.get("har_rmse"),
+            "GARCH":       ph5.get("garch",          {}).get("rmse"),
+            "LightGBM":    ph5.get("lgbm_rv",        {}).get("rmse") or results.get("lgbm_rmse"),
+            "TCN":         ph5.get("tcn_rv",         {}).get("rmse") or results.get("tcn_rmse"),
+            "Transformer": ph5.get("transformer_rv", {}).get("rmse") or results.get("transformer_rmse"),
         }
         rmse_data = {k: v for k, v in rmse_data.items() if v is not None}
+        _model_colors = {"HAR-RV": "#ffd166", "GARCH": WARN, "LightGBM": ACCENT,
+                         "TCN": "#06d6a0", "Transformer": ACCENT2}
         if rmse_data:
-            best_k = min(rmse_data, key=rmse_data.get)
-            colors = [ACCENT if k == best_k else ACCENT2 for k in rmse_data]
+            colors = [_model_colors.get(k, TEXT_DIM) for k in rmse_data]
             fig = go.Figure(go.Bar(
                 x=list(rmse_data.keys()), y=list(rmse_data.values()),
                 marker_color=colors,
@@ -940,13 +974,12 @@ def page_models(results):
                     unsafe_allow_html=True)
         col_a, col_b = st.columns(2)
 
+        ph5_shock = (results.get("per_horizon") or {}).get("5s", {}).get("lgbm_shock", {})
         auroc_data = {k: v for k, v in {
-            "LightGBM": results.get("auroc"),
-            "TCN":      results.get("tcn_auroc"),
+            "LightGBM": ph5_shock.get("auroc") or results.get("auroc"),
         }.items() if v is not None}
         auprc_data = {k: v for k, v in {
-            "LightGBM": results.get("auprc"),
-            "TCN":      results.get("tcn_auprc"),
+            "LightGBM": ph5_shock.get("auprc") or results.get("auprc"),
         }.items() if v is not None}
 
         def bar_chart(data, title, yref=None):
@@ -1009,6 +1042,270 @@ def page_models(results):
 
     with tab4:
         _render_feature_ablation(results)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE: LIVE
+# ══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_resource
+def _load_lgbm_models() -> dict:
+    """Load per-horizon LGBM models from models/. Returns {horizon: LGBMDualModel}."""
+    import pickle
+    models = {}
+    for h in ("1s", "5s", "30s"):
+        p = Path(f"models/lgbm_model_{h}.pkl")
+        if p.exists():
+            with open(p, "rb") as fh:
+                models[h] = pickle.load(fh)
+    return models
+
+
+def _build_live_features(rows: list[dict]) -> "pl.DataFrame | None":
+    """
+    Run feature engineering on a list of raw LOB rows.
+    Returns None if there aren't enough rows to produce valid features.
+    """
+    try:
+        from engineer import build_features, feature_cols, clean
+        from config import FeatureConfig
+        cfg = FeatureConfig()
+        df = pl.DataFrame(rows)
+        df = df.with_columns(pl.col("timestamp_ns").cast(pl.Int64))
+        feat_df = build_features(
+            df,
+            rv_windows=cfg.rv_windows,
+            ofi_window=cfg.ofi_window,
+            har_lags=cfg.har_lags,
+            horizons=cfg.horizons,
+            ticks_per_second=cfg.ticks_per_second,
+            lob_levels=5,
+        )
+        fcols = feature_cols(feat_df, har_lags=cfg.har_lags, lob_levels=5)
+        if not fcols:
+            return None
+        feat_df = clean(feat_df, fcols)
+        return feat_df, fcols
+    except Exception:
+        return None
+
+
+def _predict_live(feat_df, fcols: list[str], lgbm_models: dict) -> dict:
+    """
+    Run LGBM predictions on the last valid row of feat_df.
+    Returns dict with rv predictions and shock probabilities per horizon.
+    """
+    preds = {}
+    if feat_df is None or len(feat_df) == 0:
+        return preds
+    last_row = feat_df.tail(1).select(fcols).to_numpy()
+    for h, model in lgbm_models.items():
+        try:
+            rv_pred = float(model.predict_rv(last_row)[0])
+            shock_proba = model.predict_shock_proba(last_row)[0]
+            shock_p = float(shock_proba[1]) if len(shock_proba) > 1 else float(shock_proba[0])
+            preds[h] = {"rv": rv_pred, "shock_p": shock_p}
+        except Exception:
+            pass
+    return preds
+
+
+def page_live():
+    st.markdown('<div class="section-title">Live Order Book + Predictions</div>',
+                unsafe_allow_html=True)
+
+    # ── Controls ──────────────────────────────────────────────────────────────
+    col_ctl, col_status = st.columns([3, 2])
+    with col_ctl:
+        pair = st.selectbox("Pair", ["XBTUSD", "ETHUSD", "SOLUSD", "DOGEUSD"],
+                            key="live_pair")
+        refresh_s = st.slider("Auto-refresh interval (s)", 1, 10, 2, key="live_refresh")
+
+    # ── Stream lifecycle ──────────────────────────────────────────────────────
+    stream_key = f"live_stream_{pair}"
+    if stream_key not in st.session_state:
+        st.session_state[stream_key] = None
+
+    c_start, c_stop = col_ctl.columns(2)
+    with c_start:
+        if st.button("▶ Start Stream", key="live_start"):
+            if st.session_state[stream_key] is None or not st.session_state[stream_key].is_running:
+                from kraken_feed import KrakenWSStream
+                stream = KrakenWSStream(pair=pair, levels=5, maxlen=600)
+                stream.start()
+                st.session_state[stream_key] = stream
+
+    with c_stop:
+        if st.button("■ Stop", key="live_stop"):
+            s = st.session_state.get(stream_key)
+            if s is not None:
+                s.stop()
+                st.session_state[stream_key] = None
+
+    stream = st.session_state.get(stream_key)
+    with col_status:
+        if stream and stream.is_running:
+            n_rows     = len(stream.snapshot_deque)
+            persisted  = getattr(stream, "rows_persisted", 0)
+            st.markdown(
+                f'<div class="info-box" style="margin-top:1.6rem;">'
+                f'<span style="color:{ACCENT}">● LIVE</span> &nbsp;·&nbsp; '
+                f'{n_rows} in memory &nbsp;·&nbsp; '
+                f'<span style="color:{TEXT_DIM}">{persisted:,} saved to disk</span></div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                f'<div class="info-box" style="margin-top:1.6rem;">'
+                f'<span style="color:{TEXT_DIM}">○ Stopped</span> &nbsp;·&nbsp; '
+                f'Press ▶ to connect</div>',
+                unsafe_allow_html=True,
+            )
+
+    if stream is None or not stream.is_running or len(stream.snapshot_deque) < 10:
+        _no_data_box("Waiting for enough snapshots to start predictions (need ≥ 10)…")
+        if stream and stream.is_running:
+            st.rerun()
+        return
+
+    rows = list(stream.snapshot_deque)
+    latest = rows[-1]
+
+    # ── KPI strip: mid, spread, predictions ──────────────────────────────────
+    lgbm_models = _load_lgbm_models()
+    result = _build_live_features(rows)
+    preds = {}
+    if result is not None:
+        feat_df, fcols = result
+        preds = _predict_live(feat_df, fcols, lgbm_models)
+
+    mid    = latest.get("mid_price", 0)
+    spread = latest.get("spread", 0)
+
+    kpi_cols = st.columns(2 + len(preds) * 2)
+    with kpi_cols[0]:
+        st.markdown(card(metric_html("Mid Price", f"${mid:,.2f}")), unsafe_allow_html=True)
+    with kpi_cols[1]:
+        st.markdown(card(metric_html("Spread", f"${spread:.5f}")), unsafe_allow_html=True)
+
+    col_idx = 2
+    for h in ("1s", "5s", "30s"):
+        if h not in preds:
+            continue
+        rv    = preds[h]["rv"]
+        shock = preds[h]["shock_p"]
+        shock_color = WARN if shock > 0.5 else ACCENT
+        shock_label = "HIGH SHOCK" if shock > 0.5 else f"{shock:.1%}"
+        with kpi_cols[col_idx]:
+            st.markdown(
+                card(metric_html(f"RV Forecast ({h})", f"{rv:.2e}")),
+                unsafe_allow_html=True,
+            )
+        with kpi_cols[col_idx + 1]:
+            st.markdown(
+                card(f'<div class="metric-value" style="color:{shock_color}">{shock_label}</div>'
+                     f'<div class="metric-label">Shock prob ({h})</div>'),
+                unsafe_allow_html=True,
+            )
+        col_idx += 2
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Live LOB table ────────────────────────────────────────────────────────
+    LEVELS = sum(1 for i in range(10) if f"bid_p{i}" in latest)
+    bids, asks = [], []
+    for i in range(LEVELS):
+        bp = latest.get(f"bid_p{i}", float("nan"))
+        bq = latest.get(f"bid_q{i}", 0.0)
+        ap = latest.get(f"ask_p{i}", float("nan"))
+        aq = latest.get(f"ask_q{i}", 0.0)
+        if bp and not (bp != bp):   # nan check
+            bids.append((bp, bq))
+        if ap and not (ap != ap):
+            asks.append((ap, aq))
+
+    max_q = max(([q for _, q in bids] + [q for _, q in asks]) or [1])
+
+    def depth_bar(q, side):
+        w = max(4, int(q / max_q * 80))
+        cls = "depth-bar-bid" if side == "bid" else "depth-bar-ask"
+        return f'<span class="{cls}" style="width:{w}px;"></span>'
+
+    tbl_header = "<tr><th>Price</th><th>Quantity</th><th>Level</th></tr>"
+    bid_rows = "".join(
+        f"<tr><td class='bid-price'>${p:,.2f}</td>"
+        f"<td>{depth_bar(q,'bid')}{q:,.4f}</td>"
+        f"<td style='color:{TEXT_DIM}'>{i+1}</td></tr>"
+        for i, (p, q) in enumerate(bids)
+    )
+    ask_rows = "".join(
+        f"<tr><td class='ask-price'>${p:,.2f}</td>"
+        f"<td>{depth_bar(q,'ask')}{q:,.4f}</td>"
+        f"<td style='color:{TEXT_DIM}'>{i+1}</td></tr>"
+        for i, (p, q) in enumerate(asks)
+    )
+    col_bid, col_ask = st.columns(2)
+    with col_bid:
+        st.markdown(card(f"<table class='lob-table'>{tbl_header}{bid_rows}</table>", "Bids"),
+                    unsafe_allow_html=True)
+    with col_ask:
+        st.markdown(card(f"<table class='lob-table'>{tbl_header}{ask_rows}</table>", "Asks"),
+                    unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Rolling mid-price + spread chart ─────────────────────────────────────
+    st.markdown('<div class="section-title">Live Price & Spread</div>', unsafe_allow_html=True)
+    n_chart = min(len(rows), 300)
+    chart_rows = rows[-n_chart:]
+    mids    = [r["mid_price"] for r in chart_rows]
+    spreads = [r["spread"]    for r in chart_rows]
+    xs = list(range(len(chart_rows)))
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.72, 0.28], vertical_spacing=0.04)
+    fig.add_trace(go.Scatter(x=xs, y=mids, name="Mid Price",
+                             line=dict(color=ACCENT, width=1.5),
+                             fill="tozeroy", fillcolor="rgba(79,255,176,0.04)"),
+                  row=1, col=1)
+    fig.add_trace(go.Scatter(x=xs, y=spreads, name="Spread",
+                             line=dict(color=ACCENT2, width=1.2),
+                             fill="tozeroy", fillcolor="rgba(123,108,255,0.08)"),
+                  row=2, col=1)
+    fig.update_layout(**PLOTLY_THEME, height=380, showlegend=True)
+    _apply_axis_style(fig)
+    fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
+    fig.update_yaxes(title_text="Spread", row=2, col=1)
+    fig.update_xaxes(title_text="Snapshot #", row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True)
+
+    # ── Rolling RV forecast chart ─────────────────────────────────────────────
+    if result is not None and len(feat_df) > 1:
+        st.markdown('<div class="section-title">Rolling Volatility Forecast</div>',
+                    unsafe_allow_html=True)
+        rv_fig = go.Figure()
+        palette = {"1s": ACCENT, "5s": ACCENT2, "30s": WARN}
+        for h, model in lgbm_models.items():
+            try:
+                X = feat_df.select(fcols).to_numpy()
+                rv_series = model.predict_rv(X)
+                rv_fig.add_trace(go.Scatter(
+                    y=rv_series,
+                    name=f"RV {h}",
+                    line=dict(color=palette.get(h, TEXT), width=1.3),
+                ))
+            except Exception:
+                pass
+        rv_fig.update_layout(**PLOTLY_THEME, height=280)
+        _apply_axis_style(rv_fig)
+        rv_fig.update_yaxes(title_text="Predicted RV")
+        rv_fig.update_xaxes(title_text="Snapshot #")
+        st.plotly_chart(rv_fig, use_container_width=True)
+
+    # ── Auto-refresh ──────────────────────────────────────────────────────────
+    import time as _time
+    _time.sleep(refresh_s)
+    st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1134,14 +1431,12 @@ def main():
     df      = load_latest_data()
     results = load_results()
 
-    if page == "Overview":
-        page_overview(df, results)
-    elif page == "Order Book":
-        page_order_book(df)
-    elif page == "Features":
+    if page == "Features":
         page_features(df)
     elif page == "Models":
         page_models(results)
+    elif page == "Live":
+        page_live()
     elif page == "Data Collection":
         page_data_collection()
 
