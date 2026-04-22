@@ -23,7 +23,7 @@ from statsmodels.regression.linear_model import OLS
 import lightgbm as lgb
 
 # Re-export deep models so existing imports from models.py continue to work
-from deep_models import (  # noqa: F401
+from .deep_models import (  # noqa: F401
     TCNModel,
     TransformerModel,
 )

@@ -28,13 +28,13 @@ import mlflow
 
 import polars as pl
 
-from config import PipelineConfig
-from engineer import build_features, feature_cols, clean
-from dataset import make_splits
-from models import (
+from .config import PipelineConfig
+from .engineer import build_features, feature_cols, clean
+from .dataset import make_splits
+from .models import (
     DataLoader, HARRVModel, GARCHModel, LGBMDualModel, diebold_mariano,
 )
-from deep_models import TCNModel, TransformerModel
+from .deep_models import TCNModel, TransformerModel
 
 EXPERIMENT_NAME = "volatility-forecasting"
 

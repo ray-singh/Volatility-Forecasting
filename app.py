@@ -243,7 +243,7 @@ st.markdown(f"""
 @st.cache_resource
 def load_config():
     try:
-        from config import DataConfig, FeatureConfig, ModelConfig
+        from src.config import DataConfig, FeatureConfig, ModelConfig
         return DataConfig(), FeatureConfig(), ModelConfig()
     except Exception:
         return None, None, None
@@ -559,8 +559,8 @@ def page_features(df):
         return
 
     try:
-        from engineer import build_features, feature_cols, clean
-        from config import FeatureConfig
+        from src.engineer import build_features, feature_cols
+        from src.config import FeatureConfig
         cfg = FeatureConfig()
         feat_df = build_features(
             df,
@@ -997,8 +997,10 @@ def _render_latency_profiling():
 
         rv_times, sh_times = [], []
 
+        har_predict = getattr(model, "predict", None) if (rv_booster is None and net is None) else None
+
         if rv_booster is not None and sh_booster is not None:
-            # LGBM path
+            # LGBM: bypass sklearn wrapper
             X_dummy = rng.standard_normal((1, n_feat)).astype(np.float64)
             for _ in range(warmup + n_runs):
                 t0 = _time.perf_counter()
@@ -1010,7 +1012,7 @@ def _render_latency_profiling():
                 sh_times.append(_time.perf_counter() - t0)
 
         elif net is not None:
-            # Deep model path — remap to CPU, run net forward
+            # Deep model: remap weights to CPU, time net forward pass
             net.to("cpu")
             net.eval()
             X_np = rng.standard_normal((seq_len, n_feat)).astype(np.float32)
@@ -1022,10 +1024,17 @@ def _render_latency_profiling():
                     t0 = _time.perf_counter()
                     net(X_t)
                     rv_times.append(_time.perf_counter() - t0)
-                for _ in range(warmup + n_runs):
-                    t0 = _time.perf_counter()
-                    net(X_t)
-                    sh_times.append(_time.perf_counter() - t0)
+            sh_times = rv_times  # single forward produces both heads; report same latency
+
+        elif har_predict is not None:
+            # HAR-RV: statsmodels OLS, single-feature input
+            n_params = getattr(getattr(model, "model", None), "params", np.array([0])).shape[0]
+            X_dummy = rng.standard_normal((1, n_params))
+            for _ in range(warmup + n_runs):
+                t0 = _time.perf_counter()
+                har_predict(X_dummy)
+                rv_times.append(_time.perf_counter() - t0)
+            sh_times = []  # HAR is regression-only, no shock head
 
         else:
             results_rows.append({
@@ -1042,15 +1051,16 @@ def _render_latency_profiling():
         def _fmt(arr, pct):
             return f"{np.percentile(arr, pct):.3f}" if len(arr) else "—"
 
-        total_s = rv_timed.sum() / 1000 + sh_timed.sum() / 1000
-        tput = f"{2 * n_runs / total_s:,.0f}" if total_s > 0 else "—"
+        # throughput = predictions per second (one full inference = rv + shock)
+        combined_s = (rv_timed.sum() + sh_timed.sum()) / 1000
+        tput = f"{n_runs / combined_s:,.0f}" if combined_s > 0 else "—"
 
         results_rows.append({
-            "Model":             pkl_path.stem,
-            "RV p50 (ms)":       _fmt(rv_timed, 50),
-            "RV p99 (ms)":       _fmt(rv_timed, 99),
-            "Shock p50 (ms)":    _fmt(sh_timed, 50),
-            "Shock p99 (ms)":    _fmt(sh_timed, 99),
+            "Model":               pkl_path.stem,
+            "RV p50 (ms)":         _fmt(rv_timed, 50),
+            "RV p99 (ms)":         _fmt(rv_timed, 99),
+            "Shock p50 (ms)":      _fmt(sh_timed, 50) if len(sh_timed) else "N/A",
+            "Shock p99 (ms)":      _fmt(sh_timed, 99) if len(sh_timed) else "N/A",
             "Throughput (pred/s)": tput,
         })
         progress.progress((idx + 1) / len(pkl_files),
@@ -1069,7 +1079,8 @@ def _render_latency_profiling():
     for row in results_rows:
         rows_html += "<tr>" + "".join(f"<td>{row[c]}</td>" for c in header_cols) + "</tr>"
     tbl = f'<table class="model-table"><tr>{th}</tr>{rows_html}</table>'
-    st.markdown(card(tbl, f"Results — {n_runs} timed runs, single-row input"),
+    device_note = "LGBM: cpu · Deep models: cpu (benchmarked on CPU for isolation)"
+    st.markdown(card(tbl, f"Results — {n_runs} timed runs, single-row input · {device_note}"),
                 unsafe_allow_html=True)
 
     # ── p50 bar chart for RV latency
@@ -1248,8 +1259,8 @@ def _build_live_features(rows: list[dict]) -> "pl.DataFrame | None":
     Returns None if there aren't enough rows to produce valid features.
     """
     try:
-        from engineer import build_features, feature_cols, clean
-        from config import FeatureConfig
+        from src.engineer import build_features, feature_cols, clean
+        from src.config import FeatureConfig
         cfg = FeatureConfig()
         df = pl.DataFrame(rows)
         df = df.with_columns(pl.col("timestamp_ns").cast(pl.Int64))

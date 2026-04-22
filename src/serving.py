@@ -7,7 +7,7 @@ Endpoints:
     POST /predict             — run RV + shock inference on a LOB snapshot batch
 
 Usage:
-    uvicorn serving:app --host 0.0.0.0 --port 8000 --reload
+    uvicorn src.serving:app --host 0.0.0.0 --port 8000 --reload
 
 Environment variables:
     MODEL_DIR   — directory containing *.pkl model files (default: models/)
@@ -27,8 +27,8 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from config import FeatureConfig
-from engineer import build_features, clean, feature_cols
+from .config import FeatureConfig
+from .engineer import build_features, clean, feature_cols
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
