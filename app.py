@@ -1,6 +1,7 @@
 """
 Streamlit dashboard for volatility forecasting pipeline.
 """
+import os
 import streamlit as st
 import polars as pl
 import numpy as np
@@ -922,6 +923,182 @@ def _render_feature_ablation(results: dict):
     st.markdown(card(tbl, ""), unsafe_allow_html=True)
 
 
+def _render_latency_profiling():
+    import io as _io
+    import time as _time
+    import pickle as _pickle
+    import torch as _torch
+
+    _device = "mps" if _torch.backends.mps.is_available() else "cpu"
+
+    class _SafeUnpickler(_pickle.Unpickler):
+        def find_class(self, module, name):
+            if module == "torch.storage" and name == "_load_from_bytes":
+                return lambda b: _torch.load(
+                    _io.BytesIO(b), map_location=_device, weights_only=False
+                )
+            return super().find_class(module, name)
+
+    def _load_model(path):
+        with open(path, "rb") as fh:
+            model = _SafeUnpickler(fh).load()
+        if hasattr(model, "device"):
+            model.device = _torch.device(_device)
+        if hasattr(model, "net") and model.net is not None:
+            model.net.to(_device)
+        return model
+
+    st.markdown('<div class="section-title">Inference Latency Benchmark</div>',
+                unsafe_allow_html=True)
+
+    n_runs = st.slider("Warmup + timed runs per model", min_value=10, max_value=500,
+                        value=100, step=10)
+
+    if not st.button("Run Benchmark"):
+        st.markdown(
+            '<div class="info-box">Click <strong>Run Benchmark</strong> to time '
+            'predict_rv() and predict_shock_proba() for each loaded model.</div>',
+            unsafe_allow_html=True,
+        )
+        return
+
+    models_dir = Path("models")
+    pkl_files = sorted(models_dir.glob("*.pkl"))
+    if not pkl_files:
+        st.warning("No .pkl files found in models/")
+        return
+
+    results_rows = []
+    warmup = max(3, n_runs // 10)
+    rng = np.random.default_rng(42)
+
+    progress = st.progress(0.0, text="Benchmarking…")
+    for idx, pkl_path in enumerate(pkl_files):
+        try:
+            model = _load_model(pkl_path)
+        except Exception as e:
+            results_rows.append({"Model": pkl_path.stem, "RV p50 (ms)": "load error",
+                                  "RV p99 (ms)": str(e), "Shock p50 (ms)": "—",
+                                  "Shock p99 (ms)": "—", "Throughput (pred/s)": "—"})
+            continue
+
+        # LGBM: call booster_.predict directly (avoids sklearn force_all_finite compat error).
+        # Deep: remap to CPU and run net forward directly.
+        rv_model   = getattr(model, "rv_model",    None)
+        sh_model   = getattr(model, "shock_model", None)
+        rv_booster = getattr(rv_model, "booster_", None)
+        sh_booster = getattr(sh_model, "booster_", None)
+        net        = getattr(model,    "net",       None)
+        scaler     = getattr(model,    "scaler",    None)
+
+        n_feat  = getattr(scaler, "n_features_in_", None) \
+                  or getattr(rv_model, "n_features_in_", None) or 54
+        seq_len = getattr(model, "seq_len", 1)
+
+        rv_times, sh_times = [], []
+
+        if rv_booster is not None and sh_booster is not None:
+            # LGBM path
+            X_dummy = rng.standard_normal((1, n_feat)).astype(np.float64)
+            for _ in range(warmup + n_runs):
+                t0 = _time.perf_counter()
+                rv_booster.predict(X_dummy)
+                rv_times.append(_time.perf_counter() - t0)
+            for _ in range(warmup + n_runs):
+                t0 = _time.perf_counter()
+                sh_booster.predict(X_dummy)
+                sh_times.append(_time.perf_counter() - t0)
+
+        elif net is not None:
+            # Deep model path — remap to CPU, run net forward
+            net.to("cpu")
+            net.eval()
+            X_np = rng.standard_normal((seq_len, n_feat)).astype(np.float32)
+            if scaler is not None:
+                X_np = scaler.transform(X_np).astype(np.float32)
+            X_t = _torch.from_numpy(X_np).unsqueeze(0)  # (1, seq_len, n_feat)
+            with _torch.no_grad():
+                for _ in range(warmup + n_runs):
+                    t0 = _time.perf_counter()
+                    net(X_t)
+                    rv_times.append(_time.perf_counter() - t0)
+                for _ in range(warmup + n_runs):
+                    t0 = _time.perf_counter()
+                    net(X_t)
+                    sh_times.append(_time.perf_counter() - t0)
+
+        else:
+            results_rows.append({
+                "Model": pkl_path.stem, "RV p50 (ms)": "unsupported",
+                "RV p99 (ms)": "—", "Shock p50 (ms)": "—",
+                "Shock p99 (ms)": "—", "Throughput (pred/s)": "—",
+            })
+            progress.progress((idx + 1) / len(pkl_files), text=f"Skipped {pkl_path.stem}")
+            continue
+
+        rv_timed = np.array(rv_times[warmup:]) * 1000  # ms
+        sh_timed = np.array(sh_times[warmup:]) * 1000
+
+        def _fmt(arr, pct):
+            return f"{np.percentile(arr, pct):.3f}" if len(arr) else "—"
+
+        total_s = rv_timed.sum() / 1000 + sh_timed.sum() / 1000
+        tput = f"{2 * n_runs / total_s:,.0f}" if total_s > 0 else "—"
+
+        results_rows.append({
+            "Model":             pkl_path.stem,
+            "RV p50 (ms)":       _fmt(rv_timed, 50),
+            "RV p99 (ms)":       _fmt(rv_timed, 99),
+            "Shock p50 (ms)":    _fmt(sh_timed, 50),
+            "Shock p99 (ms)":    _fmt(sh_timed, 99),
+            "Throughput (pred/s)": tput,
+        })
+        progress.progress((idx + 1) / len(pkl_files),
+                          text=f"Benchmarked {pkl_path.stem}")
+
+    progress.empty()
+
+    if not results_rows:
+        st.warning("No models could be benchmarked.")
+        return
+
+    # ── Latency table
+    header_cols = list(results_rows[0].keys())
+    th = "".join(f"<th>{c}</th>" for c in header_cols)
+    rows_html = ""
+    for row in results_rows:
+        rows_html += "<tr>" + "".join(f"<td>{row[c]}</td>" for c in header_cols) + "</tr>"
+    tbl = f'<table class="model-table"><tr>{th}</tr>{rows_html}</table>'
+    st.markdown(card(tbl, f"Results — {n_runs} timed runs, single-row input"),
+                unsafe_allow_html=True)
+
+    # ── p50 bar chart for RV latency
+    try:
+        chart_data = {r["Model"]: float(r["RV p50 (ms)"]) for r in results_rows
+                      if r["RV p50 (ms)"] not in ("—", "load error")}
+    except ValueError:
+        chart_data = {}
+
+    if chart_data:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="section-title">RV Inference p50 Latency</div>',
+                    unsafe_allow_html=True)
+        best_k = min(chart_data, key=chart_data.get)
+        colors = [ACCENT if k == best_k else ACCENT2 for k in chart_data]
+        fig = go.Figure(go.Bar(
+            x=list(chart_data.keys()),
+            y=list(chart_data.values()),
+            marker_color=colors,
+            text=[f"{v:.3f} ms" for v in chart_data.values()],
+            textposition="outside",
+            textfont=dict(color=TEXT, size=10),
+        ))
+        fig.update_layout(**PLOTLY_THEME, height=300, bargap=0.35)
+        _apply_axis_style(fig)
+        fig.update_yaxes(title_text="Latency (ms)")
+        st.plotly_chart(fig, use_container_width=True)
+
+
 def page_models(results):
     st.markdown('<div class="section-title">Model Evaluation</div>', unsafe_allow_html=True)
 
@@ -929,11 +1106,12 @@ def page_models(results):
         _no_data_box("No results found. Run <code>python train.py ...</code> to generate results.json.")
         return
 
-    tab1, tab2, tab3, tab4 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5 = st.tabs([
         "Overall Comparison",
         "Multi-Horizon",
         "Regime Analysis",
         "Feature Ablation",
+        "Latency Profiling",
     ])
 
     with tab1:
@@ -1043,6 +1221,9 @@ def page_models(results):
     with tab4:
         _render_feature_ablation(results)
 
+    with tab5:
+        _render_latency_profiling()
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE: LIVE
@@ -1090,6 +1271,32 @@ def _build_live_features(rows: list[dict]) -> "pl.DataFrame | None":
         return None
 
 
+_API_URL = os.environ.get("API_URL", "").rstrip("/")
+
+
+def _predict_via_api(rows: list[dict]) -> dict | None:
+    """
+    Call the FastAPI /predict endpoint with raw LOB rows.
+    Returns preds dict on success, None on any failure.
+    """
+    try:
+        import requests as _requests
+        resp = _requests.post(
+            f"{_API_URL}/predict",
+            json={"snapshots": rows},
+            timeout=5,
+        )
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        return {
+            h: {"rv": v["rv"], "shock_p": v["shock_probability"]}
+            for h, v in data.get("predictions", {}).items()
+        }
+    except Exception:
+        return None
+
+
 def _predict_live(feat_df, fcols: list[str], lgbm_models: dict) -> dict:
     """
     Run LGBM predictions on the last valid row of feat_df.
@@ -1117,7 +1324,7 @@ def page_live():
     # ── Controls ──────────────────────────────────────────────────────────────
     col_ctl, col_status = st.columns([3, 2])
     with col_ctl:
-        pair = st.selectbox("Pair", ["XBTUSD", "ETHUSD", "SOLUSD", "DOGEUSD"],
+        pair = st.selectbox("Pair", ["XBTUSD"],
                             key="live_pair")
         refresh_s = st.slider("Auto-refresh interval (s)", 1, 10, 2, key="live_refresh")
 
@@ -1174,9 +1381,15 @@ def page_live():
     # ── KPI strip: mid, spread, predictions ──────────────────────────────────
     lgbm_models = _load_lgbm_models()
     result = _build_live_features(rows)
+    feat_df, fcols = result if result is not None else (None, [])
     preds = {}
-    if result is not None:
-        feat_df, fcols = result
+    if _API_URL:
+        api_preds = _predict_via_api(rows)
+        if api_preds is not None:
+            preds = api_preds
+        elif feat_df is not None:
+            preds = _predict_live(feat_df, fcols, lgbm_models)
+    elif feat_df is not None:
         preds = _predict_live(feat_df, fcols, lgbm_models)
 
     mid    = latest.get("mid_price", 0)

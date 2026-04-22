@@ -530,7 +530,6 @@ def train(
         # 7. LightGBM — per horizon
         # ─────────────────────────────────────────────────────────────────────
         _section("7. LightGBM Dual Model (per horizon)")
-        _log("Skipped due to scikit-learn compatibility issue")
 
         lgbm_models:        dict[str, LGBMDualModel] = {}
         lgbm_rv_metrics:    dict[str, dict] = {}
@@ -538,6 +537,57 @@ def train(
         lgbm_shock_metrics_calib: dict[str, dict] = {}
         lgbm_rv_preds:      dict[str, np.ndarray] = {}
         primary_key = f"{seq_horizon_s}s" if f"{seq_horizon_s}s" in splits.y_rv else f"{horizons[0]}s"
+
+        for h in horizons:
+            key = f"{h}s"
+            if key not in splits.y_rv:
+                continue
+            t0 = time.perf_counter()
+            _log(f"Training LGBM for horizon {key}...")
+
+            lgbm = LGBMDualModel(lgbm_params=cfg.models.lgbm_params)
+            lgbm.fit(
+                splits.X_train, splits.y_rv[key]["train"],
+                splits.y_shock_spread[key]["train"],
+                X_val=splits.X_val,
+                y_rv_val=splits.y_rv[key]["val"],
+                y_shock_val=splits.y_shock_spread[key]["val"],
+            )
+            lgbm_models[key] = lgbm
+
+            lgbm_rv_pred_test   = lgbm.predict_rv(splits.X_test)
+            lgbm_shock_proba    = lgbm.predict_shock_proba(splits.X_test)
+            lgbm_shock_proba_val = lgbm.predict_shock_proba(splits.X_val)
+
+            lgbm_shock_proba_calib = calibrate_shock_probabilities(
+                splits.y_shock_spread[key]["val"],
+                lgbm_shock_proba_val,
+                splits.y_shock_spread[key]["test"],
+                lgbm_shock_proba,
+            )
+
+            lgbm_rv_metrics[key]    = evaluate_rv_forecast(splits.y_rv[key]["test"], lgbm_rv_pred_test)
+            lgbm_shock_metrics[key] = evaluate_shock_forecast(splits.y_shock_spread[key]["test"], lgbm_shock_proba)
+            lgbm_shock_metrics_calib[key] = evaluate_shock_forecast(splits.y_shock_spread[key]["test"], lgbm_shock_proba_calib)
+            lgbm_rv_preds[key] = lgbm_rv_pred_test
+
+            lgbm_time = time.perf_counter() - t0
+            _print_rv_metrics(f"LGBM RV ({key})",          lgbm_rv_metrics[key])
+            _print_shock_metrics(f"LGBM Shock ({key})",    lgbm_shock_metrics[key])
+            _print_shock_metrics(f"LGBM Shock Calib ({key})", lgbm_shock_metrics_calib[key])
+            _log(f"Fit time: {lgbm_time:.2f}s")
+            mlflow.log_metrics({
+                f"lgbm_{key}_rv_rmse":          lgbm_rv_metrics[key]["rmse"],
+                f"lgbm_{key}_rv_mae":           lgbm_rv_metrics[key]["mae"],
+                f"lgbm_{key}_rv_qlike":         lgbm_rv_metrics[key]["qlike"],
+                f"lgbm_{key}_shock_auroc":      lgbm_shock_metrics[key]["auroc"],
+                f"lgbm_{key}_shock_auprc":      lgbm_shock_metrics[key]["auprc"],
+                f"lgbm_{key}_shock_brier":      lgbm_shock_metrics[key]["brier"],
+                f"lgbm_{key}_shock_auroc_calib": lgbm_shock_metrics_calib[key]["auroc"],
+                f"lgbm_{key}_shock_auprc_calib": lgbm_shock_metrics_calib[key]["auprc"],
+                f"lgbm_{key}_shock_brier_calib": lgbm_shock_metrics_calib[key]["brier"],
+                f"lgbm_{key}_fit_time":         lgbm_time,
+            })
 
         # ─────────────────────────────────────────────────────────────────────
         # 8. TCN (optional, one horizon)
@@ -687,7 +737,6 @@ def train(
 
             if transformer is not None:
                 path = Path("models") / "transformer_model.pkl"
-                import pickle
                 with open(path, "wb") as f:
                     pickle.dump(transformer, f)
                 mlflow.log_artifact(str(path))
@@ -747,11 +796,17 @@ def train(
         ablation_results: dict = {}
 
         if primary_key in splits.y_rv:
-            ablation_results = run_feature_ablation(
-                splits, fcols, cfg.features.feature_groups,
-                cfg.models.lgbm_params, horizon_key=primary_key,
-            )
-            _log(f"  Baseline RMSE: {ablation_results['_baseline']['rmse']:.6f}")
+            try:
+                ablation_results = run_feature_ablation(
+                    splits, fcols, cfg.features.feature_groups,
+                    cfg.models.lgbm_params, horizon_key=primary_key,
+                )
+                _log(f"  Baseline RMSE: {ablation_results['_baseline']['rmse']:.6f}")
+            except TypeError as e:
+                if "force_all_finite" in str(e):
+                    _log("Skipped (LightGBM sklearn compatibility issue)")
+                else:
+                    raise
         else:
             _log("Skipped (primary horizon not in splits)")
 
@@ -846,6 +901,9 @@ def train(
             if tcn_rv_metrics is not None and key == tcn_key:
                 per_horizon[key]["tcn_rv"]    = tcn_rv_metrics
                 per_horizon[key]["tcn_shock"] = tcn_shock_metrics
+            if transformer_rv_metrics is not None and key == transformer_key:
+                per_horizon[key]["transformer_rv"]    = transformer_rv_metrics
+                per_horizon[key]["transformer_shock"] = transformer_shock_metrics
 
         results = {
             "horizons":    horizons,
@@ -927,8 +985,10 @@ def main():
                         help="Forecast horizons in seconds (default: 1 5 30)")
     parser.add_argument("--seq-horizon",    type=int,   default=5,
                         help="Horizon (s) for TCN/Transformer (default: 5)")
-    parser.add_argument("--max-rows",       type=int,   default=None,
-                        help="Max rows to load (default: all)")
+    parser.add_argument("--max-rows",       type=int,   default=5_500_000,
+                        help="Max rows to load (default: 5500000)")
+    parser.add_argument("--lob-levels",     type=int,   default=None,
+                        help="Number of LOB levels in the data (default: from config, 10)")
     args = parser.parse_args()
 
     cfg = PipelineConfig()
@@ -936,6 +996,8 @@ def main():
     cfg.features.horizons    = args.horizons
     if args.source == "kraken":
         cfg.data.symbol = args.pair
+    if args.lob_levels is not None:
+        cfg.data.lob_levels = args.lob_levels
 
     try:
         results = train(
