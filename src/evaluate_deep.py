@@ -26,10 +26,13 @@ from .train import evaluate_rv_forecast, evaluate_shock_forecast, calibrate_shoc
 
 
 class _CPUUnpickler(pickle.Unpickler):
-    """Remap CUDA tensors to CPU when loading on a MPS-only machine."""
+    """Remap CUDA tensors to CPU and handle module renames from pre-src/ layout."""
     def find_class(self, module, name):
         if module == "torch.storage" and name == "_load_from_bytes":
             return lambda b: torch.load(io.BytesIO(b), map_location="mps", weights_only=False)
+        # Models pickled before the src/ restructure used bare module names
+        if module in ("deep_models", "models", "config", "engineer", "dataset"):
+            module = f"src.{module}"
         return super().find_class(module, name)
 
 
@@ -142,10 +145,15 @@ def main():
             y_shock_test = splits.y_shock_spread[key]["test"]
             y_shock_val  = splits.y_shock_spread[key]["val"]
 
+            # Trim features to match what the model's scaler was fit on
+            n_model_feats = model.scaler.n_features_in_
+            X_test_m = splits.X_test[:, :n_model_feats]
+            X_val_m  = splits.X_val[:, :n_model_feats]
+
             try:
-                rv_pred        = model.predict_rv(splits.X_test)
-                shock_proba    = model.predict_shock_proba(splits.X_test)
-                shock_proba_val = model.predict_shock_proba(splits.X_val)
+                rv_pred        = model.predict_rv(X_test_m)
+                shock_proba    = model.predict_shock_proba(X_test_m)
+                shock_proba_val = model.predict_shock_proba(X_val_m)
             except Exception as e:
                 print(f"  [{name} {key}] predict failed: {e} — skipping")
                 continue

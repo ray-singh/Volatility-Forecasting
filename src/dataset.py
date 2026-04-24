@@ -31,8 +31,10 @@ class Splits:
 
     # Multi-horizon targets
     y_rv:           dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    y_log_rv:       dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
     y_shock_spread: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
     y_shock_depth:  dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    y_vol_jump:     dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
 
     # Feature column names (stored for ablation)
     feature_cols: list[str] = field(default_factory=list)
@@ -120,6 +122,13 @@ def make_splits(
         if "depth_ratio" in feat_df_train.columns else None
     )
 
+    # Vol-jump threshold: µ + 2σ of training RV (300-tick rolling, evaluated at train end)
+    rv_roll_mean_train = feat_df_train["rv_50"].rolling_mean(window_size=300)
+    rv_roll_std_train  = feat_df_train["rv_50"].rolling_std(window_size=300)
+    _mean_at_end = float(rv_roll_mean_train[-1] or 0.0)
+    _std_at_end  = float(rv_roll_std_train[-1] or 0.0)
+    vol_jump_threshold_train = _mean_at_end + 2.0 * _std_at_end
+
     # Rebuild shock targets using training-only thresholds
     for h_s in horizons:
         h_ticks = max(1, int(round(h_s * 2.0)))  # Default ticks_per_second=2.0
@@ -146,6 +155,15 @@ def make_splits(
                 ).cast(pl.Int32).alias(sd_col)
             )
 
+        vj_col = f"target_vol_jump_{h_s}s"
+        if vj_col in feat_df.columns and vol_jump_threshold_train > 0:
+            rv_col = f"target_rv_{h_s}s"
+            if rv_col in feat_df.columns:
+                feat_df = feat_df.with_columns(
+                    (pl.col(rv_col) > vol_jump_threshold_train)
+                    .cast(pl.Int32).alias(vj_col)
+                )
+
     # Feature matrix — contiguous for stride_tricks in sequence building
     X = np.ascontiguousarray(feat_df.select(feature_cols).to_numpy())
     X_train = X[:train_end].copy()
@@ -153,8 +171,10 @@ def make_splits(
     X_test  = X[val_end:].copy()
 
     y_rv:           dict[str, dict[str, np.ndarray]] = {}
+    y_log_rv:       dict[str, dict[str, np.ndarray]] = {}
     y_shock_spread: dict[str, dict[str, np.ndarray]] = {}
     y_shock_depth:  dict[str, dict[str, np.ndarray]] = {}
+    y_vol_jump:     dict[str, dict[str, np.ndarray]] = {}
 
     def _split(arr: np.ndarray) -> dict[str, np.ndarray]:
         return {
@@ -162,6 +182,10 @@ def make_splits(
             "val":   arr[train_end:val_end].copy(),
             "test":  arr[val_end:].copy(),
         }
+
+    def _split_int(arr: np.ndarray) -> dict[str, np.ndarray]:
+        arr = np.nan_to_num(arr, nan=0).astype(np.int64)
+        return _split(np.ascontiguousarray(arr))
 
     for h_s in horizons:
         key = f"{h_s}s"
@@ -172,25 +196,33 @@ def make_splits(
                 np.ascontiguousarray(feat_df[rv_col].to_numpy().ravel())
             )
 
+        log_rv_col = f"target_log_rv_{h_s}s"
+        if log_rv_col in feat_df.columns:
+            y_log_rv[key] = _split(
+                np.ascontiguousarray(feat_df[log_rv_col].to_numpy().ravel())
+            )
+
         ss_col = f"target_shock_spread_{h_s}s"
         if ss_col in feat_df.columns:
-            arr = feat_df[ss_col].to_numpy().ravel()
-            arr = np.nan_to_num(arr, nan=0).astype(np.int64)
-            y_shock_spread[key] = _split(np.ascontiguousarray(arr))
+            y_shock_spread[key] = _split_int(feat_df[ss_col].to_numpy().ravel())
 
         sd_col = f"target_shock_depth_{h_s}s"
         if sd_col in feat_df.columns:
-            arr = feat_df[sd_col].to_numpy().ravel()
-            arr = np.nan_to_num(arr, nan=0).astype(np.int64)
-            y_shock_depth[key] = _split(np.ascontiguousarray(arr))
+            y_shock_depth[key] = _split_int(feat_df[sd_col].to_numpy().ravel())
+
+        vj_col = f"target_vol_jump_{h_s}s"
+        if vj_col in feat_df.columns:
+            y_vol_jump[key] = _split_int(feat_df[vj_col].to_numpy().ravel())
 
     return Splits(
         X_train=X_train,
         X_val=X_val,
         X_test=X_test,
         y_rv=y_rv,
+        y_log_rv=y_log_rv,
         y_shock_spread=y_shock_spread,
         y_shock_depth=y_shock_depth,
+        y_vol_jump=y_vol_jump,
         feature_cols=feature_cols,
         test_slice=(val_end, n),
     )

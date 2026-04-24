@@ -23,9 +23,9 @@ class FeatureConfig:
     rv_windows: list[int] = field(default_factory=lambda: [50, 300])
     har_lags: list[int] = field(default_factory=lambda: [50])
     ofi_window: int = 20
-    # Forecast horizons in seconds; at 0.5s poll interval, 1s ≈ 2 ticks
+    # Forecast horizons in seconds; training data sampled at 100ms → 10 ticks/s
     horizons: list[int] = field(default_factory=lambda: [1, 5, 30])
-    ticks_per_second: float = 2.0
+    ticks_per_second: float = 10.0
     # Feature groups for ablation analysis
     feature_groups: dict = field(default_factory=lambda: {
         "rv":        ["rv_50", "rv_300", "rv_momentum_10", "rv_momentum_20"],

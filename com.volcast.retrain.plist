@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Label must match the filename (without .plist) -->
+  <key>Label</key>
+  <string>com.volcast.retrain</string>
+
+  <!-- Run nightly at 03:00 -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key>   <integer>3</integer>
+    <key>Minute</key> <integer>0</integer>
+  </dict>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/rayanshsingh/Documents/Volatility-Forecasting/venv/bin/python</string>
+    <string>train.py</string>
+    <string>--source</string>
+    <string>parquet</string>
+    <string>--path</string>
+    <string>data/live_buffer.parquet</string>
+    <string>--lob-levels</string>
+    <string>5</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/rayanshsingh/Documents/Volatility-Forecasting</string>
+
+  <!-- Logs — check with: tail -f /tmp/volcast_retrain.log -->
+  <key>StandardOutPath</key>
+  <string>/tmp/volcast_retrain.log</string>
+  <key>StandardErrorPath</key>
+  <string>/tmp/volcast_retrain.log</string>
+
+  <!-- Only run when logged in -->
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

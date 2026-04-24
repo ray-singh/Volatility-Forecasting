@@ -2,6 +2,7 @@
 Streamlit dashboard for volatility forecasting pipeline.
 """
 import os
+import pickle as _pickle
 import streamlit as st
 import polars as pl
 import numpy as np
@@ -11,6 +12,15 @@ from plotly.subplots import make_subplots
 from datetime import datetime
 from pathlib import Path
 import json
+from src.kraken_feed import KrakenWSStream
+
+
+class _RemapUnpickler(_pickle.Unpickler):
+    """Remap bare module names saved before the src/ restructure."""
+    def find_class(self, module, name):
+        if module in ("models", "deep_models", "config", "engineer", "dataset"):
+            module = f"src.{module}"
+        return super().find_class(module, name)
 
 # ── Page config (must be first Streamlit call) ─────────────────────────────
 st.set_page_config(
@@ -252,12 +262,11 @@ def load_config():
 @st.cache_resource
 def load_trained_models():
     try:
-        import pickle
         models_dir = Path("models")
         models = {}
         for f in models_dir.glob("*.pkl"):
             with open(f, "rb") as fh:
-                models[f.stem] = pickle.load(fh)
+                models[f.stem] = _RemapUnpickler(fh).load()
         return models or None
     except Exception:
         return None
@@ -312,7 +321,11 @@ def badge(text: str, style: str = "dim") -> str:
 
 
 # ── Navigation ───────────────────────────────────────────────────────────────
-NAV_PAGES = ["Features", "Models", "Live", "Data Collection"]
+# Backtest is compute-intensive — only expose it on local deployments.
+# Set VOLCAST_ENV=production in your server environment to hide it.
+_IS_LOCAL = os.environ.get("VOLCAST_ENV", "local").lower() != "production"
+
+NAV_PAGES = ["Features", "Models", "Live"] + (["Backtest"] if _IS_LOCAL else [])
 
 def render_topbar():
     # Brand + nav as columns
@@ -937,6 +950,8 @@ def _render_latency_profiling():
                 return lambda b: _torch.load(
                     _io.BytesIO(b), map_location=_device, weights_only=False
                 )
+            if module in ("models", "deep_models", "config", "engineer", "dataset"):
+                module = f"src.{module}"
             return super().find_class(module, name)
 
     def _load_model(path):
@@ -1241,15 +1256,15 @@ def page_models(results):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
+@st.cache_resource
 def _load_lgbm_models() -> dict:
     """Load per-horizon LGBM models from models/. Returns {horizon: LGBMDualModel}."""
-    import pickle
     models = {}
     for h in ("1s", "5s", "30s"):
         p = Path(f"models/lgbm_model_{h}.pkl")
         if p.exists():
             with open(p, "rb") as fh:
-                models[h] = pickle.load(fh)
+                models[h] = _RemapUnpickler(fh).load()
     return models
 
 
@@ -1275,10 +1290,12 @@ def _build_live_features(rows: list[dict]) -> "pl.DataFrame | None":
         )
         fcols = feature_cols(feat_df, har_lags=cfg.har_lags, lob_levels=5)
         if not fcols:
+            st.warning("feature_cols() returned empty list")
             return None
         feat_df = clean(feat_df, fcols)
         return feat_df, fcols
-    except Exception:
+    except Exception as e:
+        st.warning(f"Feature engineering failed: {e}")
         return None
 
 
@@ -1319,12 +1336,14 @@ def _predict_live(feat_df, fcols: list[str], lgbm_models: dict) -> dict:
     last_row = feat_df.tail(1).select(fcols).to_numpy()
     for h, model in lgbm_models.items():
         try:
-            rv_pred = float(model.predict_rv(last_row)[0])
-            shock_proba = model.predict_shock_proba(last_row)[0]
+            n_feats = model.rv_model.n_features_in_
+            X = last_row[:, :n_feats]
+            rv_pred = float(model.predict_rv(X)[0])
+            shock_proba = model.predict_shock_proba(X)[0]
             shock_p = float(shock_proba[1]) if len(shock_proba) > 1 else float(shock_proba[0])
             preds[h] = {"rv": rv_pred, "shock_p": shock_p}
-        except Exception:
-            pass
+        except Exception as e:
+            st.warning(f"[debug] predict {h} failed: {e}")
     return preds
 
 
@@ -1337,21 +1356,27 @@ def page_live():
     with col_ctl:
         pair = st.selectbox("Pair", ["XBTUSD"],
                             key="live_pair")
-        refresh_s = st.slider("Auto-refresh interval (s)", 1, 10, 2, key="live_refresh")
 
     # ── Stream lifecycle ──────────────────────────────────────────────────────
     stream_key = f"live_stream_{pair}"
     if stream_key not in st.session_state:
         st.session_state[stream_key] = None
 
+    # Auto-start stream on first visit
+    if st.session_state[stream_key] is None or not st.session_state[stream_key].is_running:
+        stream = KrakenWSStream(pair=pair, levels=5, maxlen=600)
+        stream.start()
+        st.session_state[stream_key] = stream
+
     c_start, c_stop = col_ctl.columns(2)
     with c_start:
-        if st.button("▶ Start Stream", key="live_start"):
-            if st.session_state[stream_key] is None or not st.session_state[stream_key].is_running:
-                from kraken_feed import KrakenWSStream
-                stream = KrakenWSStream(pair=pair, levels=5, maxlen=600)
-                stream.start()
-                st.session_state[stream_key] = stream
+        if st.button("▶ Restart Stream", key="live_start"):
+            s = st.session_state.get(stream_key)
+            if s is not None:
+                s.stop()
+            stream = KrakenWSStream(pair=pair, levels=5, maxlen=600)
+            stream.start()
+            st.session_state[stream_key] = stream
 
     with c_stop:
         if st.button("■ Stop", key="live_stop"):
@@ -1398,9 +1423,7 @@ def page_live():
         api_preds = _predict_via_api(rows)
         if api_preds is not None:
             preds = api_preds
-        elif feat_df is not None:
-            preds = _predict_live(feat_df, fcols, lgbm_models)
-    elif feat_df is not None:
+    if not preds and feat_df is not None:
         preds = _predict_live(feat_df, fcols, lgbm_models)
 
     mid    = latest.get("mid_price", 0)
@@ -1496,9 +1519,12 @@ def page_live():
                              line=dict(color=ACCENT2, width=1.2),
                              fill="tozeroy", fillcolor="rgba(123,108,255,0.08)"),
                   row=2, col=1)
+    price_min = min(mids)
+    price_max = max(mids)
     fig.update_layout(**PLOTLY_THEME, height=380, showlegend=True)
     _apply_axis_style(fig)
-    fig.update_yaxes(title_text="Price (USD)", row=1, col=1)
+    fig.update_yaxes(title_text="Price (USD)", row=1, col=1,
+                     range=[price_min - 10, price_max + 10])
     fig.update_yaxes(title_text="Spread", row=2, col=1)
     fig.update_xaxes(title_text="Snapshot #", row=2, col=1)
     st.plotly_chart(fig, use_container_width=True)
@@ -1511,7 +1537,8 @@ def page_live():
         palette = {"1s": ACCENT, "5s": ACCENT2, "30s": WARN}
         for h, model in lgbm_models.items():
             try:
-                X = feat_df.select(fcols).to_numpy()
+                n_feats = model.rv_model.n_features_in_
+                X = feat_df.select(fcols).to_numpy()[:, :n_feats]
                 rv_series = model.predict_rv(X)
                 rv_fig.add_trace(go.Scatter(
                     y=rv_series,
@@ -1526,117 +1553,208 @@ def page_live():
         rv_fig.update_xaxes(title_text="Snapshot #")
         st.plotly_chart(rv_fig, use_container_width=True)
 
-    # ── Auto-refresh ──────────────────────────────────────────────────────────
+    # Poll until the WebSocket pushes a new snapshot, then rerun
     import time as _time
-    _time.sleep(refresh_s)
-    st.rerun()
+    live_stream = st.session_state.get(stream_key)
+    if live_stream and live_stream.is_running:
+        n_before = len(live_stream.snapshot_deque)
+        for _ in range(20):  # wait up to 1s in 50ms ticks
+            _time.sleep(0.05)
+            if len(live_stream.snapshot_deque) != n_before:
+                break
+        st.rerun()
+
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PAGE: DATA COLLECTION
+# PAGE: BACKTEST
 # ══════════════════════════════════════════════════════════════════════════════
-def page_data_collection():
-    st.markdown('<div class="section-title">Data Ingestion</div>', unsafe_allow_html=True)
+def page_backtest():
+    from src.backtest import run_backtest
+    from src.engineer import build_features, feature_cols, clean
+    from src.models import DataLoader
+    from src.config import PipelineConfig
 
-    col_live, col_upload = st.columns(2)
-
-    with col_live:
-        st.markdown(
-            card("""
-<div class="card-header">Kraken L2 Orderbook — Live Collector</div>
-"""),
-            unsafe_allow_html=True,
-        )
-        pair        = st.selectbox("Trading Pair", ["XBTUSD", "ETHUSD", "DOGEUSD", "SOLUSD"])
-        n_snapshots = st.number_input("Snapshots", 10, 50000, 200, 10)
-        mode        = st.radio(
-            "Collection Mode",
-            ["WebSocket (real-time stream)", "REST (poll)"],
-            horizontal=True,
-        )
-
-        if mode == "REST (poll)":
-            poll_interval = st.number_input("Poll Interval (s)", 0.1, 10.0, 1.0, 0.1)
-        else:
-            timeout_s = st.number_input("Timeout (s)", 10, 600, 120, 10)
-
-        if st.button("Collect Live Data"):
-            with st.spinner("Streaming from Kraken…"):
-                try:
-                    if mode == "WebSocket (real-time stream)":
-                        from kraken_feed import collect_kraken_ws_snapshots
-                        df = collect_kraken_ws_snapshots(
-                            pair=pair, n_snapshots=n_snapshots,
-                            levels=10, timeout_s=timeout_s,
-                        )
-                    else:
-                        from kraken_feed import collect_kraken_snapshots
-                        df = collect_kraken_snapshots(
-                            pair=pair, n_snapshots=n_snapshots,
-                            levels=10, poll_interval_s=poll_interval,
-                        )
-                    out_dir  = Path("data/raw")
-                    out_dir.mkdir(parents=True, exist_ok=True)
-                    out_file = out_dir / f"kraken_{pair}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
-                    df.write_parquet(out_file)
-                    st.success(f"Collected {len(df):,} snapshots → `{out_file.name}`")
-                except Exception as e:
-                    st.error(f"Collection failed: {e}")
-
-    with col_upload:
-        st.markdown(
-            card("""
-<div class="card-header">Upload Local Data File</div>
-"""),
-            unsafe_allow_html=True,
-        )
-        uploaded = st.file_uploader("Drop a .parquet or .csv file", type=["parquet", "csv"])
-        if uploaded:
-            try:
-                df = (pl.read_parquet(uploaded) if uploaded.name.endswith(".parquet")
-                      else pl.read_csv(uploaded))
-                out_dir  = Path("data/raw")
-                out_dir.mkdir(parents=True, exist_ok=True)
-                out_file = out_dir / f"upload_{datetime.now().strftime('%Y%m%d_%H%M%S')}.parquet"
-                df.write_parquet(out_file)
-                st.success(f"Saved {len(df):,} rows → `{out_file.name}`")
-            except Exception as e:
-                st.error(f"Upload failed: {e}")
-
-    # ── Existing data files
-    st.markdown("<br>", unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Available Data Files</div>', unsafe_allow_html=True)
-
-    all_files = []
-    csv_dir = Path("data/csv")
-    if csv_dir.exists():
-        all_files += sorted(csv_dir.glob("order-book-*.csv"), key=lambda p: p.name)
-    data_dir = Path("data/raw")
-    if data_dir.exists():
-        all_files += sorted(data_dir.glob("*.parquet"), key=lambda p: p.stat().st_mtime, reverse=True)
-
-    if all_files:
-        rows = ""
-        for fp in all_files[:30]:
-            size_kb = fp.stat().st_size / 1024
-            mtime   = datetime.fromtimestamp(fp.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            rows += f"<tr><td>{fp.name}</td><td>{fp.parent.name}/</td><td>{size_kb:,.0f} KB</td><td>{mtime}</td></tr>"
-        tbl = f"""<table class="model-table">
-          <tr><th>File</th><th>Folder</th><th>Size</th><th>Modified</th></tr>{rows}</table>"""
-        st.markdown(card(tbl, ""), unsafe_allow_html=True)
-    else:
-        _no_data_box("No data files found in data/csv/ or data/raw/")
-
-    # ── CLI reminder
-    st.markdown("<br>", unsafe_allow_html=True)
+    st.markdown('<div class="section-title">Walk-Forward Backtest</div>', unsafe_allow_html=True)
     st.markdown(
-        f'<div class="info-box">'
-        f'<strong>Training is done via CLI:</strong><br>'
-        f'<code>python train.py --source csv</code> &nbsp;(uses all CSVs in data/csv/)<br>'
-        f'<code>python train.py --source parquet --path data/raw/&lt;file&gt;.parquet</code>'
+        f'<div class="info-box" style="margin-bottom:1rem;">'
+        f'Retrains LightGBM on each fold using only past data, then evaluates on the next unseen block. '
+        f'Also simulates a market-making strategy: quote normally when shock probability is low, sit out when it is high.'
         f'</div>',
         unsafe_allow_html=True,
     )
+
+    cfg = PipelineConfig()
+
+    # ── Controls ────────────────────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        source = st.selectbox("Data Source", ["csv", "parquet"], key="bt_source")
+    with c2:
+        horizon = st.selectbox("Horizon (s)", [1, 5, 30], index=1, key="bt_horizon")
+    with c3:
+        n_folds = st.slider("Folds", min_value=2, max_value=10, value=5, key="bt_folds")
+    with c4:
+        shock_threshold = st.slider("Shock Sit-Out Threshold", 0.1, 0.9, 0.5, 0.05, key="bt_thresh")
+
+    parquet_path = None
+    if source == "parquet":
+        parquet_files = sorted(Path("data/raw").glob("*.parquet")) + sorted(Path("data/orderbook").glob("*.parquet"))
+        if parquet_files:
+            chosen = st.selectbox("Parquet File", [str(p) for p in parquet_files], key="bt_parquet")
+            parquet_path = chosen
+        else:
+            st.warning("No parquet files found in data/raw/ or data/orderbook/.")
+            return
+
+    run_btn = st.button("Run Backtest", type="primary", key="bt_run")
+    if not run_btn:
+        return
+
+    with st.spinner("Loading data and running walk-forward folds — this may take a minute…"):
+        try:
+            loader = DataLoader(
+                source=source,
+                path=parquet_path,
+                csv_dir=str(cfg.data.csv_dir),
+            )
+            raw_df = loader.load()
+        except Exception as e:
+            st.error(f"Failed to load data: {e}")
+            return
+
+        try:
+            feat_df = build_features(
+                raw_df,
+                rv_windows=cfg.features.rv_windows,
+                ofi_window=cfg.features.ofi_window,
+                har_lags=cfg.features.har_lags,
+                horizons=[horizon],
+                ticks_per_second=cfg.features.ticks_per_second,
+                lob_levels=cfg.data.lob_levels,
+            )
+            fcols = feature_cols(feat_df, har_lags=cfg.features.har_lags, lob_levels=cfg.data.lob_levels)
+            rv_col    = f"target_rv_{horizon}s"
+            shock_col = f"target_shock_spread_{horizon}s"
+            extra = [c for c in [rv_col, shock_col, "spread"] if c in feat_df.columns and c not in fcols]
+            keep = fcols + extra
+            feat_df = clean(feat_df, keep)
+        except Exception as e:
+            st.error(f"Feature engineering failed: {e}")
+            return
+
+        try:
+            result = run_backtest(
+                feat_df, fcols,
+                horizon_s=horizon,
+                n_folds=n_folds,
+                shock_threshold=shock_threshold,
+                lgbm_params=cfg.models.lgbm_params,
+                verbose=False,
+            )
+        except Exception as e:
+            st.error(f"Backtest failed: {e}")
+            return
+
+    # ── Summary KPIs ────────────────────────────────────────────────────────
+    st.markdown('<div class="section-title" style="margin-top:1.5rem;">Summary</div>', unsafe_allow_html=True)
+    k1, k2, k3, k4, k5 = st.columns(5)
+    kpis = [
+        ("RMSE (mean)", f"{result.rmse_mean:.4e}", f"± {result.rmse_std:.2e}"),
+        ("MAE (mean)",  f"{result.mae_mean:.4e}",  ""),
+        ("AUROC (mean)",f"{result.auroc_mean:.4f}", f"± {result.auroc_std:.4f}"),
+        ("MM Sharpe",   f"{result.sharpe_mean:.2f}", "annualised"),
+        ("Total PnL",   f"{result.total_pnl:.4f}",  "sim units"),
+    ]
+    for col, (label, val, sub) in zip([k1, k2, k3, k4, k5], kpis):
+        with col:
+            st.markdown(
+                f'<div class="card" style="text-align:center;">'
+                f'<div class="metric-value" style="font-size:1.4rem;">{val}</div>'
+                f'<div style="font-size:0.7rem;color:{TEXT_DIM};margin-top:0.15rem;">{sub}</div>'
+                f'<div class="metric-label">{label}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+    # ── Per-fold table ───────────────────────────────────────────────────────
+    st.markdown('<div class="section-title" style="margin-top:1.5rem;">Per-Fold Results</div>', unsafe_allow_html=True)
+    fold_rows = [
+        {
+            "Fold":          f.fold_idx,
+            "Train rows":    f.n_train,
+            "Test rows":     f.n_test,
+            "RV RMSE":       round(f.rv_metrics["rmse"], 6),
+            "RV MAE":        round(f.rv_metrics["mae"], 6),
+            "AUROC":         round(f.shock_metrics["auroc"], 4),
+            "MM Sharpe":     round(f.pnl["sharpe"], 2),
+            "Total PnL":     round(f.pnl["total_pnl"], 4),
+            "Max Drawdown":  round(f.pnl["max_drawdown"], 4),
+            "Participation": f"{f.pnl['participation']:.1%}",
+            "Fit time (s)":  round(f.fit_time_s, 1),
+        }
+        for f in result.folds
+    ]
+    st.dataframe(fold_rows, use_container_width=True)
+
+    # ── Cumulative PnL chart ─────────────────────────────────────────────────
+    st.markdown('<div class="section-title" style="margin-top:1.5rem;">Cumulative MM PnL (across all folds)</div>', unsafe_allow_html=True)
+    all_pnl = []
+    for f in result.folds:
+        all_pnl.extend(f.pnl["pnl_series"])
+    cum_pnl = np.cumsum(all_pnl)
+
+    fig_pnl = go.Figure()
+    fig_pnl.add_trace(go.Scatter(
+        y=cum_pnl,
+        mode="lines",
+        line=dict(color=ACCENT, width=1.5),
+        fill="tozeroy",
+        fillcolor=f"rgba(79,255,176,0.08)",
+        name="Cumulative PnL",
+    ))
+    fig_pnl.add_hline(y=0, line=dict(color=WARN, width=1, dash="dot"))
+    fig_pnl.update_layout(
+        **PLOTLY_THEME,
+        height=280,
+        showlegend=False,
+        xaxis=dict(title="Tick", **_AXIS_STYLE),
+        yaxis=dict(title="Cumulative PnL", **_AXIS_STYLE),
+    )
+    st.plotly_chart(fig_pnl, use_container_width=True)
+
+    # ── Per-fold RMSE and AUROC bars ─────────────────────────────────────────
+    fc1, fc2 = st.columns(2)
+    fold_idxs = [f.fold_idx for f in result.folds]
+
+    with fc1:
+        fig_rmse = go.Figure(go.Bar(
+            x=fold_idxs,
+            y=[f.rv_metrics["rmse"] for f in result.folds],
+            marker_color=ACCENT2,
+            name="RMSE",
+        ))
+        fig_rmse.update_layout(
+            **PLOTLY_THEME, height=220,
+            xaxis=dict(title="Fold", **_AXIS_STYLE),
+            yaxis=dict(title="RV RMSE", **_AXIS_STYLE),
+        )
+        st.plotly_chart(fig_rmse, use_container_width=True)
+
+    with fc2:
+        fig_auroc = go.Figure(go.Bar(
+            x=fold_idxs,
+            y=[f.shock_metrics["auroc"] for f in result.folds],
+            marker_color=ACCENT,
+            name="AUROC",
+        ))
+        fig_auroc.add_hline(y=0.5, line=dict(color=WARN, width=1, dash="dot"))
+        fig_auroc.update_layout(
+            **PLOTLY_THEME, height=220,
+            xaxis=dict(title="Fold", **_AXIS_STYLE),
+            yaxis=dict(title="Shock AUROC", range=[0, 1], **_AXIS_STYLE),
+        )
+        st.plotly_chart(fig_auroc, use_container_width=True)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -1661,8 +1779,11 @@ def main():
         page_models(results)
     elif page == "Live":
         page_live()
-    elif page == "Data Collection":
-        page_data_collection()
+    elif page == "Backtest":
+        if _IS_LOCAL:
+            page_backtest()
+        else:
+            st.error("Backtest is not available on the hosted deployment.")
 
 
 if __name__ == "__main__":

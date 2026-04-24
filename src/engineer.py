@@ -52,6 +52,18 @@ def build_features(
     if horizons is None:
         horizons = [1, 5, 30]
 
+    # ── Quantity normalisation (exchange-agnostic) ─────────────────────────────
+    # Bybit inverse-perpetual quantities are in USD; Kraken quantities are in BTC.
+    # Normalise all bid_q*/ask_q* to BTC by dividing by mid_price when the median
+    # top-of-book quantity exceeds 10 (a value impossible in BTC for a normal LOB).
+    q_cols = [c for c in df.columns if c.startswith("bid_q") or c.startswith("ask_q")]
+    if q_cols and "bid_q0" in df.columns:
+        median_q0 = df["bid_q0"].median()
+        if median_q0 is not None and median_q0 > 10 and "mid_price" in df.columns:
+            df = df.with_columns([
+                (pl.col(c) / pl.col("mid_price")).alias(c) for c in q_cols
+            ])
+
     # ── Log returns ────────────────────────────────────────────────────────────
     df = df.with_columns(
         (pl.col("mid_price") / pl.col("mid_price").shift(1)).log().alias("log_return")
@@ -96,8 +108,10 @@ def build_features(
         )
 
     # ── Queue imbalance (top level) ────────────────────────────────────────────
+    # Normalized to [-1, 1]: avoids blowup when ask_q0 ≈ 0
     df = df.with_columns(
-        (pl.col("bid_q0") / (pl.col("ask_q0") + 1e-9)).alias("queue_imbalance")
+        ((pl.col("bid_q0") - pl.col("ask_q0")) /
+         (pl.col("bid_q0") + pl.col("ask_q0") + 1e-9)).alias("queue_imbalance")
     )
 
     # ── Per-level depth imbalance (top 5 levels) ───────────────────────────────
@@ -279,6 +293,12 @@ def build_features(
             (pl.col("mid_price") / pl.col("mid_price").shift(window) - 1).alias(f"price_velocity_{window}")
         )
 
+    # ── Vol-of-vol feature (rolling std of RV) ────────────────────────────────
+    # Captures second-order volatility dynamics; useful for shock classification.
+    df = df.with_columns(
+        pl.col("rv_50").rolling_std(window_size=50).alias("vol_of_vol_50"),
+    )
+
     # Multi-horizon forward targets ──────────────────────────────────────────
     # NOTE: Thresholds are computed on the FULL series here. In the training pipeline,
     # these MUST be recomputed on the training slice only to avoid lookahead bias.
@@ -289,17 +309,28 @@ def build_features(
         if "depth_ratio" in df.columns else None
     )
 
+    # Rolling RV stats for vol-jump shock threshold (computed once, full series)
+    # dataset.py recomputes on train slice only — these serve as initialisation.
+    _rv_roll_mean = df["rv_50"].rolling_mean(window_size=300)
+    _rv_roll_std  = df["rv_50"].rolling_std(window_size=300)
+
     for h_s in horizons:
         h_ticks = max(1, int(round(h_s * ticks_per_second)))
 
         # RV target: forward realized vol over next h_ticks
-        df = df.with_columns(
+        forward_rv = (
             (pl.col("log_return") ** 2)
             .rolling_sum(window_size=h_ticks)
             .clip(lower_bound=0.0)
             .sqrt()
             .shift(-h_ticks)
-            .alias(f"target_rv_{h_s}s")
+        )
+        df = df.with_columns(forward_rv.alias(f"target_rv_{h_s}s"))
+
+        # log-RV target: log(RV + ε) is approximately Gaussian (Andersen et al. 2001).
+        # Better-specified for OLS/HAR and gives RMSE a natural scale.
+        df = df.with_columns(
+            (forward_rv + 1e-10).log().alias(f"target_log_rv_{h_s}s")
         )
 
         # Spread shock: spread exceeds Q75 at any point in the forward window.
@@ -311,6 +342,16 @@ def build_features(
                 .rolling_max(window_size=h_ticks)
                 > spread_threshold
             ).cast(pl.Int32).alias(f"target_shock_spread_{h_s}s")
+        )
+
+        # Vol-jump shock: forward RV exceeds µ + 2σ of trailing 300-tick RV window.
+        # More statistically grounded than Q75; ~2.3% base rate under normality,
+        # giving a sharper signal for rare but consequential volatility jumps.
+        df = df.with_columns(
+            (
+                pl.col(f"target_rv_{h_s}s")
+                > (_rv_roll_mean + 2.0 * _rv_roll_std)
+            ).cast(pl.Int32).alias(f"target_vol_jump_{h_s}s")
         )
 
         # Depth depletion shock: depth_ratio drops below Q25 in the forward window.
@@ -423,6 +464,7 @@ def feature_cols(
         "squared_return",
         "rv_momentum_10",
         "rv_momentum_20",
+        "vol_of_vol_50",
         # Lag returns
         "lag_return_1",
         "lag_return_5",

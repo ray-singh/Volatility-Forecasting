@@ -226,6 +226,11 @@ def _book_to_row(bids: dict, asks: dict, levels: int) -> dict[str, Any] | None:
     row["mid_price"] = (sorted_bids[0][0] + sorted_asks[0][0]) / 2.0
     row["spread"]    = sorted_asks[0][0] - sorted_bids[0][0]
     row["last_trade_qty"] = None
+
+    bid_depth = sum(q for _, q in sorted_bids)
+    ask_depth = sum(q for _, q in sorted_asks)
+    row["depth_ratio"] = bid_depth / (ask_depth + 1e-9)
+
     return row
 
 

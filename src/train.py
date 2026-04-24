@@ -386,7 +386,11 @@ def train(
         _section("3. Cleaning")
         target_cols = (
             [f"target_rv_{h}s"            for h in horizons] +
+            [f"target_log_rv_{h}s"        for h in horizons
+             if f"target_log_rv_{h}s" in feat_df.columns] +
             [f"target_shock_spread_{h}s"  for h in horizons] +
+            [f"target_vol_jump_{h}s"      for h in horizons
+             if f"target_vol_jump_{h}s" in feat_df.columns] +
             [f"target_shock_depth_{h}s"   for h in horizons
              if f"target_shock_depth_{h}s" in feat_df.columns]
         )
@@ -401,10 +405,13 @@ def train(
              f"{dropped / rows_before * 100:.1f}%)")
 
         for h in horizons:
-            rv_s = feat_df[f"target_rv_{h}s"]
-            sk_s = feat_df[f"target_shock_spread_{h}s"]
+            rv_s  = feat_df[f"target_rv_{h}s"]
+            sk_s  = feat_df[f"target_shock_spread_{h}s"]
+            vj_col = f"target_vol_jump_{h}s"
             _log(f"  target_rv_{h}s      mean={rv_s.mean():.6f}  std={rv_s.std():.6f}")
             _log(f"  shock_spread_{h}s   rate={sk_s.mean():.3f}")
+            if vj_col in feat_df.columns:
+                _log(f"  vol_jump_{h}s       rate={feat_df[vj_col].mean():.3f}")
 
         mlflow.log_metrics({
             "data_rows_clean":   rows_after,

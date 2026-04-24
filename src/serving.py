@@ -43,12 +43,20 @@ _feat_cfg = FeatureConfig()
 _models: dict[str, Any] = {}
 
 
+class _ModuleRemapUnpickler(pickle.Unpickler):
+    """Remap bare module names saved before the src/ restructure."""
+    def find_class(self, module, name):
+        if module in ("models", "deep_models", "config", "engineer", "dataset"):
+            module = f"src.{module}"
+        return super().find_class(module, name)
+
+
 def _load_models() -> None:
     for h in ("1s", "5s", "30s"):
         path = MODEL_DIR / f"lgbm_model_{h}.pkl"
         if path.exists():
             with open(path, "rb") as f:
-                _models[h] = pickle.load(f)
+                _models[h] = _ModuleRemapUnpickler(f).load()
     if not _models:
         print("[serving] Warning: no LGBM models found in", MODEL_DIR)
     else:
@@ -219,3 +227,8 @@ def predict(req: PredictRequest) -> PredictResponse:
         n_features_used=len(fcols),
         predictions=predictions,
     )
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("src.serving:app", host="0.0.0.0", port=8000, reload=True)
