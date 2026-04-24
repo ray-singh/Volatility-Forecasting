@@ -691,6 +691,10 @@ def train(
                 seq_len=cfg.models.transformer_seq_len,
                 epochs=cfg.models.transformer_epochs,
                 batch_size=cfg.models.transformer_batch,
+                lr=cfg.models.transformer_lr,
+                patience=cfg.models.transformer_patience,
+                warmup_epochs=cfg.models.transformer_warmup_epochs,
+                label_smoothing=cfg.models.transformer_label_smoothing,
             )
             _log(f"Device: {transformer.device}")
 

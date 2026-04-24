@@ -188,6 +188,8 @@ class _SequenceModel:
         rv_loss_weight: float,
         shock_loss_weight: float,
         model_tag: str = "Model",
+        warmup_epochs: int = 2,
+        label_smoothing: float = 0.1,
     ):
         """Shared training loop with early stopping and best-weights restore."""
         X_train_s = self.scaler.fit_transform(X_train)
@@ -219,9 +221,20 @@ class _SequenceModel:
                 val_loader = self._make_loader(X_val_s, y_rv_val_s, y_shock_val, shuffle=False)
 
         train_loader    = self._make_loader(X_train_s, y_rv_train_s, y_shock_train, shuffle=True)
-        optimizer       = torch.optim.Adam(self.net.parameters(), lr=lr, weight_decay=1e-4)
+        optimizer       = torch.optim.AdamW(self.net.parameters(), lr=lr, weight_decay=1e-3)
         rv_criterion    = nn.MSELoss()
-        shock_criterion = nn.CrossEntropyLoss()
+        shock_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+
+        # Cosine annealing with linear warmup: ramps LR from 0→lr over warmup_epochs,
+        # then decays to 0 via cosine schedule. Prevents early overfitting from large
+        # gradient steps before the model has settled.
+        def _lr_lambda(epoch: int) -> float:
+            if epoch < warmup_epochs:
+                return (epoch + 1) / warmup_epochs
+            progress = (epoch - warmup_epochs) / max(epochs - warmup_epochs, 1)
+            return 0.5 * (1.0 + np.cos(np.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_lr_lambda)
 
         best_val_loss = float("inf")
         epochs_no_imp = 0
@@ -235,6 +248,7 @@ class _SequenceModel:
                 rv_loss_weight=rv_loss_weight,
                 shock_loss_weight=shock_loss_weight,
             )
+            scheduler.step()
             log = {"epoch": epoch, "train_loss": train_loss}
 
             if val_loader is not None:
@@ -246,7 +260,8 @@ class _SequenceModel:
                 )
                 log["val_loss"] = val_loss
                 print(f"[{model_tag}] Epoch {epoch:>3}/{epochs} — "
-                      f"train={train_loss:.5f}  val={val_loss:.5f}")
+                      f"train={train_loss:.5f}  val={val_loss:.5f}  "
+                      f"lr={scheduler.get_last_lr()[0]:.2e}")
 
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
@@ -259,7 +274,8 @@ class _SequenceModel:
                     print(f"[{model_tag}] Early stopping at epoch {epoch}")
                     break
             else:
-                print(f"[{model_tag}] Epoch {epoch:>3}/{epochs} — train={train_loss:.5f}")
+                print(f"[{model_tag}] Epoch {epoch:>3}/{epochs} — train={train_loss:.5f}  "
+                      f"lr={scheduler.get_last_lr()[0]:.2e}")
 
             self.train_history.append(log)
 
@@ -550,14 +566,16 @@ class TransformerModel(_SequenceModel):
         nhead: int = 4,
         num_layers: int = 2,
         dim_feedforward: int = 256,
-        dropout: float = 0.1,
+        dropout: float = 0.2,
         seq_len: int = 100,
-        epochs: int = 20,
+        epochs: int = 30,
         batch_size: int = 256,
-        lr: float = 5e-4,
+        lr: float = 1e-4,
         rv_loss_weight: float = 1.0,
         shock_loss_weight: float = 1.0,
-        patience: int = 10,
+        patience: int = 7,
+        warmup_epochs: int = 3,
+        label_smoothing: float = 0.1,
         device: str | None = None,
     ):
         assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
@@ -573,6 +591,8 @@ class TransformerModel(_SequenceModel):
         self.rv_loss_weight    = rv_loss_weight
         self.shock_loss_weight = shock_loss_weight
         self.patience          = patience
+        self.warmup_epochs     = warmup_epochs
+        self.label_smoothing   = label_smoothing
         self.device            = _get_device(device)
         self.scaler            = StandardScaler()
         self.net: _TransformerNet | None = None
@@ -604,6 +624,8 @@ class TransformerModel(_SequenceModel):
             rv_loss_weight=self.rv_loss_weight,
             shock_loss_weight=self.shock_loss_weight,
             model_tag="Transformer",
+            warmup_epochs=self.warmup_epochs,
+            label_smoothing=self.label_smoothing,
         )
         return self
 

@@ -79,10 +79,14 @@ class ModelConfig:
     transformer_nhead: int = 4
     transformer_num_layers: int = 2
     transformer_dim_feedforward: int = 256
-    transformer_dropout: float = 0.1
+    transformer_dropout: float = 0.2
     transformer_seq_len: int = 100
-    transformer_epochs: int = 20
+    transformer_epochs: int = 30
     transformer_batch: int = 256
+    transformer_lr: float = 1e-4
+    transformer_patience: int = 7
+    transformer_warmup_epochs: int = 3
+    transformer_label_smoothing: float = 0.1
 
 
 @dataclass
