@@ -107,9 +107,10 @@ class _SequenceModel:
         train: bool,
         rv_loss_weight: float = 1.0,
         shock_loss_weight: float = 1.0,
-    ) -> float:
+    ) -> tuple[float, float, float]:
+        """Returns (total_loss, rv_loss, shock_loss) averaged over the dataset."""
         self.net.train(train)
-        total_loss = 0.0
+        total_loss = rv_total = shock_total = 0.0
         with torch.set_grad_enabled(train):
             for X_batch, y_rv_batch, y_shock_batch in loader:
                 X_batch       = X_batch.to(self.device)
@@ -127,9 +128,13 @@ class _SequenceModel:
                     nn.utils.clip_grad_norm_(self.net.parameters(), max_norm=1.0)
                     optimizer.step()
 
-                total_loss += loss.item() * len(X_batch)
+                n = len(X_batch)
+                total_loss  += loss.item()    * n
+                rv_total    += rv_loss.item() * n
+                shock_total += shock_loss.item() * n
 
-        return total_loss / len(loader.dataset)
+        d = len(loader.dataset)
+        return total_loss / d, rv_total / d, shock_total / d
 
     def _predict_raw(self, X_s: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -242,29 +247,34 @@ class _SequenceModel:
         self.train_history: list[dict] = []
 
         for epoch in range(1, epochs + 1):
-            train_loss = self._run_epoch(
+            train_loss, train_rv, train_shock = self._run_epoch(
                 train_loader, optimizer, rv_criterion, shock_criterion,
                 train=True,
                 rv_loss_weight=rv_loss_weight,
                 shock_loss_weight=shock_loss_weight,
             )
             scheduler.step()
-            log = {"epoch": epoch, "train_loss": train_loss}
+            log = {"epoch": epoch, "train_loss": train_loss,
+                   "train_rv": train_rv, "train_shock": train_shock}
 
             if val_loader is not None:
-                val_loss = self._run_epoch(
+                val_loss, val_rv, val_shock = self._run_epoch(
                     val_loader, None, rv_criterion, shock_criterion,
                     train=False,
                     rv_loss_weight=rv_loss_weight,
                     shock_loss_weight=shock_loss_weight,
                 )
-                log["val_loss"] = val_loss
-                print(f"[{model_tag}] Epoch {epoch:>3}/{epochs} — "
-                      f"train={train_loss:.5f}  val={val_loss:.5f}  "
-                      f"lr={scheduler.get_last_lr()[0]:.2e}")
+                log.update({"val_loss": val_loss, "val_rv": val_rv, "val_shock": val_shock})
+                print(
+                    f"[{model_tag}] Epoch {epoch:>3}/{epochs} — "
+                    f"train={train_loss:.4f} (rv={train_rv:.4f} sh={train_shock:.4f})  "
+                    f"val={val_loss:.4f} (rv={val_rv:.4f} sh={val_shock:.4f})  "
+                    f"lr={scheduler.get_last_lr()[0]:.2e}"
+                )
 
-                if val_loss < best_val_loss:
-                    best_val_loss = val_loss
+                # Early stopping on val RV only — shock CE is noisier and can mask RV progress
+                if val_rv < best_val_loss:
+                    best_val_loss = val_rv
                     best_state = {k: v.cpu().clone() for k, v in self.net.state_dict().items()}
                     epochs_no_imp = 0
                 else:
@@ -274,7 +284,8 @@ class _SequenceModel:
                     print(f"[{model_tag}] Early stopping at epoch {epoch}")
                     break
             else:
-                print(f"[{model_tag}] Epoch {epoch:>3}/{epochs} — train={train_loss:.5f}  "
+                print(f"[{model_tag}] Epoch {epoch:>3}/{epochs} — "
+                      f"train={train_loss:.4f} (rv={train_rv:.4f} sh={train_shock:.4f})  "
                       f"lr={scheduler.get_last_lr()[0]:.2e}")
 
             self.train_history.append(log)
