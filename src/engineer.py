@@ -482,6 +482,62 @@ def feature_cols(
     return [c for c in candidates if c in df.columns]
 
 
+def deep_feature_cols(
+    df: pl.DataFrame,
+    har_lags: list[int] | None = None,
+    lob_levels: int = 10,
+) -> list[str]:
+    """
+    Feature subset for sequence models (TCN, Transformer).
+
+    Drops rolling stats that are redundant given the model already sees a
+    sequence of raw observations (lag returns, rolling means/stds, spread
+    trends, OFI stats, RV momentum).  Keeps only features that carry
+    information beyond what a seq_len-tick context window can reconstruct:
+    longer-horizon RV (rv_300, har_rv), instantaneous microstructure state,
+    and depth/book-shape signals.
+    """
+    if har_lags is None:
+        har_lags = [50]
+
+    candidates = [
+        # Core microstructure — instantaneous, not derivable from raw LOB sequence
+        "queue_imbalance",
+        "ofi_20",
+        "ofi_1s",
+        "ofi_3s",
+        "ofi_5s",
+        # RV — rv_300 spans 300 ticks, far beyond seq_len=64; har_rv is multi-scale
+        "rv_50",
+        "rv_300",
+        *[f"har_rv_{lag}" for lag in har_lags],
+        # Spread — instantaneous state
+        "spread",
+        "relative_spread",
+        "spread_zscore_50",
+        # Microprice & pressure — derived from full book, not just mid
+        "microprice",
+        "price_pressure",
+        # Depth & book shape — cross-level signals the model can't see from price alone
+        "depth_ratio",
+        "total_bid_depth",
+        "total_ask_depth",
+        "depth_near_far_bid",
+        "depth_near_far_ask",
+        "bid_level_concentration",
+        "bid_slope",
+        "ask_slope",
+        "bid_price_gap",
+        "ask_price_gap",
+        *[f"depth_imb_{i}" for i in range(min(5, lob_levels))],
+        # Volatility proxies — squared_return and vol_of_vol need longer history
+        "squared_return",
+        "vol_of_vol_50",
+        "trade_intensity_50",
+    ]
+    return [c for c in candidates if c in df.columns]
+
+
 def clean(df: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
     """
     Clean features by replacing infinities with None and dropping null rows.

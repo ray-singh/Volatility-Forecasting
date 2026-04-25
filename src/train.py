@@ -29,7 +29,7 @@ import mlflow
 import polars as pl
 
 from .config import PipelineConfig
-from .engineer import build_features, feature_cols, clean
+from .engineer import build_features, feature_cols, deep_feature_cols, clean
 from .dataset import make_splits
 from .models import (
     DataLoader, HARRVModel, GARCHModel, LGBMDualModel, diebold_mariano,
@@ -437,6 +437,15 @@ def train(
             splits.X_val.shape[0],
             splits.X_test.shape[0],
         )
+
+        # Slim feature matrix for sequence models — drop rolling stats redundant with context
+        deep_fcols = deep_feature_cols(feat_df, har_lags=cfg.features.har_lags,
+                                       lob_levels=cfg.data.lob_levels)
+        deep_idx   = [fcols.index(c) for c in deep_fcols]
+        X_train_deep = splits.X_train[:, deep_idx]
+        X_val_deep   = splits.X_val[:,   deep_idx]
+        X_test_deep  = splits.X_test[:,  deep_idx]
+        _log(f"Deep model features ({len(deep_fcols)}): {deep_fcols}")
         _log(f"Train:    {n_train:,} rows  ({n_train / rows_after * 100:.1f}%)")
         _log(f"Val:      {n_val:,} rows  ({n_val / rows_after * 100:.1f}%)")
         _log(f"Test:     {n_test:,} rows  ({n_test / rows_after * 100:.1f}%)")
@@ -620,18 +629,18 @@ def train(
 
             mlflow.end_run()
             tcn.fit(
-                splits.X_train, splits.y_rv[tcn_key]["train"],
+                X_train_deep, splits.y_rv[tcn_key]["train"],
                 splits.y_shock_spread[tcn_key]["train"],
-                X_val=splits.X_val,
+                X_val=X_val_deep,
                 y_rv_val=splits.y_rv[tcn_key]["val"],
                 y_shock_val=splits.y_shock_spread[tcn_key]["val"],
             )
             mlflow.start_run(run_id=run_id)
 
             tcn_time           = time.perf_counter() - t0
-            tcn_rv_pred_test   = tcn.predict_rv(splits.X_test)
-            tcn_shock_proba    = tcn.predict_shock_proba(splits.X_test)
-            tcn_shock_proba_val = tcn.predict_shock_proba(splits.X_val)
+            tcn_rv_pred_test   = tcn.predict_rv(X_test_deep)
+            tcn_shock_proba    = tcn.predict_shock_proba(X_test_deep)
+            tcn_shock_proba_val = tcn.predict_shock_proba(X_val_deep)
 
             # Calibrate shock probabilities using validation set
             tcn_shock_proba_calib = calibrate_shock_probabilities(
@@ -700,18 +709,18 @@ def train(
 
             mlflow.end_run()
             transformer.fit(
-                splits.X_train, splits.y_rv[transformer_key]["train"],
+                X_train_deep, splits.y_rv[transformer_key]["train"],
                 splits.y_shock_spread[transformer_key]["train"],
-                X_val=splits.X_val,
+                X_val=X_val_deep,
                 y_rv_val=splits.y_rv[transformer_key]["val"],
                 y_shock_val=splits.y_shock_spread[transformer_key]["val"],
             )
             mlflow.start_run(run_id=run_id)
 
             transformer_time           = time.perf_counter() - t0
-            transformer_rv_pred_test   = transformer.predict_rv(splits.X_test)
-            transformer_shock_proba    = transformer.predict_shock_proba(splits.X_test)
-            transformer_shock_proba_val = transformer.predict_shock_proba(splits.X_val)
+            transformer_rv_pred_test   = transformer.predict_rv(X_test_deep)
+            transformer_shock_proba    = transformer.predict_shock_proba(X_test_deep)
+            transformer_shock_proba_val = transformer.predict_shock_proba(X_val_deep)
 
             transformer_shock_proba_calib = calibrate_shock_probabilities(
                 splits.y_shock_spread[transformer_key]["val"],
