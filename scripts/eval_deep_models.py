@@ -56,25 +56,45 @@ class _CPUUnpickler(pickle.Unpickler):
 def load_pkl_cpu(path: Path):
     with open(path, "rb") as f:
         obj = _CPUUnpickler(f).load()
-    # Move the net to CPU so predict_rv / predict_shock_proba work
+    # Remap to MPS if available, else CPU
+    target = torch.device("mps") if torch.backends.mps.is_available() else torch.device("cpu")
     if hasattr(obj, "net") and obj.net is not None:
-        obj.net = obj.net.cpu()
+        obj.net = obj.net.to(target)
     if hasattr(obj, "device"):
-        obj.device = torch.device("cpu")
+        obj.device = target
     return obj
 
 
 # ── data pipeline ─────────────────────────────────────────────────────────────
 
-def build_test_splits():
+CACHE_PATH = Path("data/eval_split_cache.npz")
+
+
+def build_test_splits(force_rebuild: bool = False):
     cfg = PipelineConfig()
+
+    if CACHE_PATH.exists() and not force_rebuild:
+        print(f"Loading cached test split from {CACHE_PATH} ...")
+        cache = np.load(CACHE_PATH, allow_pickle=True)
+        from src.dataset import Splits
+        splits = Splits(
+            X_train=cache["X_train"],
+            X_val=cache["X_val"],
+            X_test=cache["X_test"],
+            y_rv={k: v for k, v in zip(cache["y_rv_keys"], cache["y_rv_vals"])},
+            y_shock_spread={k: v for k, v in zip(cache["y_shock_keys"], cache["y_shock_vals"])},
+        )
+        return splits, cfg
+
     data_path = Path("data/orderbook/btcusd_full.parquet")
     if not data_path.exists():
         raise FileNotFoundError(f"Data not found: {data_path}")
 
     import polars as pl
+    print("Reading parquet...")
     raw_df = pl.read_parquet(data_path)
 
+    print("Building features (this takes a few minutes)...")
     feat_df = build_features(
         raw_df,
         rv_windows=cfg.features.rv_windows,
@@ -101,6 +121,19 @@ def build_test_splits():
         train_frac=cfg.data.train_frac,
         val_frac=cfg.data.val_frac,
     )
+
+    print(f"Saving test split cache to {CACHE_PATH} ...")
+    np.savez(
+        CACHE_PATH,
+        X_train=splits.X_train,
+        X_val=splits.X_val,
+        X_test=splits.X_test,
+        y_rv_keys=np.array(list(splits.y_rv.keys())),
+        y_rv_vals=np.array([splits.y_rv[k] for k in splits.y_rv], dtype=object),
+        y_shock_keys=np.array(list(splits.y_shock_spread.keys())),
+        y_shock_vals=np.array([splits.y_shock_spread[k] for k in splits.y_shock_spread], dtype=object),
+    )
+
     return splits, cfg
 
 
@@ -111,10 +144,11 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--sample", type=float, default=1.0,
                         help="Fraction of test rows to evaluate (0 < sample <= 1.0)")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="Force rebuild of feature matrix even if cache exists")
     args = parser.parse_args()
 
-    print("Building feature matrix and test split...")
-    splits, cfg = build_test_splits()
+    splits, cfg = build_test_splits(force_rebuild=args.rebuild)
 
     results_path = Path("results.json")
     results = json.loads(results_path.read_text()) if results_path.exists() else {}

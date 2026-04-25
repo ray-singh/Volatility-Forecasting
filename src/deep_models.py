@@ -93,9 +93,10 @@ class _SequenceModel:
         shuffle: bool,
     ) -> TorchDataLoader:
         dataset = _SequenceDataset(X_s, y_rv, y_shock, self.seq_len)
+        n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         return TorchDataLoader(
-            dataset, batch_size=self.batch_size, shuffle=shuffle,
-            num_workers=0, pin_memory=False,
+            dataset, batch_size=self.batch_size * max(n_gpus, 1), shuffle=shuffle,
+            num_workers=min(n_gpus * 2, 4), pin_memory=(n_gpus > 0),
         )
 
     def _run_epoch(
@@ -217,7 +218,10 @@ class _SequenceModel:
             return
 
         self.net.to(self.device)
-        print(f"[{model_tag}] Device={self.device}  params="
+        n_gpus = torch.cuda.device_count() if self.device.type == "cuda" else 0
+        if n_gpus > 1:
+            self.net = nn.DataParallel(self.net)
+        print(f"[{model_tag}] Device={self.device}  GPUs={max(n_gpus,1)}  params="
               f"{sum(p.numel() for p in self.net.parameters()):,}  Starting training...")
 
         val_loader = None
@@ -289,6 +293,8 @@ class _SequenceModel:
 
         if best_state is not None:
             self.net.load_state_dict(best_state)
+        if isinstance(self.net, nn.DataParallel):
+            self.net = self.net.module
         self.net.eval()
 
 
