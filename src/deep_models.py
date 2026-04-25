@@ -229,10 +229,7 @@ class _SequenceModel:
         optimizer       = torch.optim.AdamW(self.net.parameters(), lr=lr, weight_decay=1e-3)
         rv_criterion    = nn.MSELoss()
         shock_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-
-        # Cosine annealing with linear warmup: ramps LR from 0→lr over warmup_epochs,
-        # then decays to 0 via cosine schedule. Prevents early overfitting from large
-        # gradient steps before the model has settled.
+        
         def _lr_lambda(epoch: int) -> float:
             if epoch < warmup_epochs:
                 return (epoch + 1) / warmup_epochs

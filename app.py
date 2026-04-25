@@ -282,14 +282,13 @@ def load_latest_data():
             if "mid" in df.columns and "mid_price" not in df.columns:
                 df = df.rename({"mid": "mid_price"})
             return df
-    # Fallback to parquet
-    data_dir = Path("data/raw")
-    if not data_dir.exists():
-        return None
-    files = list(data_dir.glob("*.parquet"))
-    if not files:
-        return None
-    return pl.read_parquet(max(files, key=lambda p: p.stat().st_mtime))
+    # Search all parquet files across known data dirs
+    candidates = []
+    for pattern in ("data/raw/*.parquet", "data/orderbook/*.parquet"):
+        candidates.extend(Path().glob(pattern))
+    if candidates:
+        return pl.read_parquet(max(candidates, key=lambda p: p.stat().st_mtime))
+    return None
 
 
 def load_results():
@@ -623,6 +622,8 @@ def page_features(df):
                     ))
             fig.update_layout(**PLOTLY_THEME, height=350)
             _apply_axis_style(fig)
+            fig.update_xaxes(title_text="Snapshot #")
+            fig.update_yaxes(title_text="Feature Value")
             st.plotly_chart(fig, use_container_width=True)
 
         # ── Correlation heatmap
@@ -632,7 +633,7 @@ def page_features(df):
             corr = feat_df.select(numeric).to_pandas().corr()
             fig = px.imshow(
                 corr,
-                color_continuous_scale=[[0, WARN], [0.5, PANEL_BG], [1, ACCENT]],
+                color_continuous_scale=[[0, "#2166ac"], [0.5, PANEL_BG], [1, "#d6604d"]],
                 color_continuous_midpoint=0,
                 aspect="auto",
             )
