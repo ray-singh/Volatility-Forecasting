@@ -290,6 +290,8 @@ class _SequenceModel:
                       f"lr={scheduler.get_last_lr()[0]:.2e}")
 
             self.train_history.append(log)
+            if self.device.type == "cuda":
+                torch.cuda.empty_cache()
 
         if best_state is not None:
             self.net.load_state_dict(best_state)
