@@ -96,7 +96,7 @@ class _SequenceModel:
         n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
         return TorchDataLoader(
             dataset, batch_size=self.batch_size * max(n_gpus, 1), shuffle=shuffle,
-            num_workers=min(n_gpus * 2, 4), pin_memory=(n_gpus > 0),
+            num_workers=0, pin_memory=(n_gpus > 0),
         )
 
     def _run_epoch(
@@ -230,7 +230,14 @@ class _SequenceModel:
                 val_loader = self._make_loader(X_val_s, y_rv_val_s, y_shock_val, shuffle=False)
 
         train_loader    = self._make_loader(X_train_s, y_rv_train_s, y_shock_train, shuffle=True)
-        optimizer       = torch.optim.AdamW(self.net.parameters(), lr=lr, weight_decay=1e-3)
+        no_decay = {"bias", "norm", "LayerNorm"}
+        param_groups = [
+            {"params": [p for n, p in self.net.named_parameters()
+                        if not any(nd in n for nd in no_decay)], "weight_decay": 1e-2},
+            {"params": [p for n, p in self.net.named_parameters()
+                        if any(nd in n for nd in no_decay)],     "weight_decay": 0.0},
+        ]
+        optimizer = torch.optim.AdamW(param_groups, lr=lr)
         rv_criterion    = nn.MSELoss()
         shock_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         
