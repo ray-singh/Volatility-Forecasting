@@ -196,6 +196,7 @@ class _SequenceModel:
         model_tag: str = "Model",
         warmup_epochs: int = 2,
         label_smoothing: float = 0.1,
+        use_data_parallel: bool = True,
     ):
         """Shared training loop with early stopping and best-weights restore."""
         X_train_s = self.scaler.fit_transform(X_train)
@@ -219,7 +220,7 @@ class _SequenceModel:
 
         self.net.to(self.device)
         n_gpus = torch.cuda.device_count() if self.device.type == "cuda" else 0
-        if n_gpus > 1:
+        if n_gpus > 1 and use_data_parallel:
             self.net = nn.DataParallel(self.net)
         print(f"[{model_tag}] Device={self.device}  GPUs={max(n_gpus,1)}  params="
               f"{sum(p.numel() for p in self.net.parameters()):,}  Starting training...")
@@ -446,6 +447,7 @@ class TCNModel(_SequenceModel):
             rv_loss_weight=self.rv_loss_weight,
             shock_loss_weight=self.shock_loss_weight,
             model_tag="TCN",
+            use_data_parallel=False,
         )
         return self
 
