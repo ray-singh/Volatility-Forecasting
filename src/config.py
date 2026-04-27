@@ -67,26 +67,28 @@ class ModelConfig:
     garch_q: int = 1
     garch_vol: str = "Garch"    # arch_model vol= argument
     garch_dist: str = "normal"
-    # TCN (expanded dilation stack: receptive field ≈ 125 ticks at kernel=3)
-    tcn_channels: list[int] = field(default_factory=lambda: [32, 64, 128, 128, 128])
+    # TCN
+    tcn_channels: list[int] = field(default_factory=lambda: [32, 32, 64, 64])
     tcn_kernel_size: int = 3
-    tcn_dropout: float = 0.2
-    tcn_seq_len: int = 200
-    tcn_epochs: int = 15
+    tcn_dropout: float = 0.3
+    tcn_seq_len: int = 30
+    tcn_epochs: int = 30
     tcn_batch: int = 256
+    tcn_shock_loss_weight: float = 0.1
     # Transformer
     transformer_d_model: int = 64
     transformer_nhead: int = 4
     transformer_num_layers: int = 2
     transformer_dim_feedforward: int = 256
     transformer_dropout: float = 0.2
-    transformer_seq_len: int = 100
+    transformer_seq_len: int = 30
     transformer_epochs: int = 30
     transformer_batch: int = 256
     transformer_lr: float = 1e-4
     transformer_patience: int = 7
     transformer_warmup_epochs: int = 3
     transformer_label_smoothing: float = 0.1
+    transformer_shock_loss_weight: float = 0.1
 
 
 @dataclass

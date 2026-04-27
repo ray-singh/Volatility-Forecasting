@@ -624,6 +624,7 @@ def train(
                 seq_len=cfg.models.tcn_seq_len,
                 epochs=cfg.models.tcn_epochs,
                 batch_size=cfg.models.tcn_batch,
+                shock_loss_weight=cfg.models.tcn_shock_loss_weight,
             )
             _log(f"Device: {tcn.device}")
 
@@ -704,6 +705,7 @@ def train(
                 patience=cfg.models.transformer_patience,
                 warmup_epochs=cfg.models.transformer_warmup_epochs,
                 label_smoothing=cfg.models.transformer_label_smoothing,
+                shock_loss_weight=cfg.models.transformer_shock_loss_weight,
             )
             _log(f"Device: {transformer.device}")
 
