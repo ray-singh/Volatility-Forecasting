@@ -1,0 +1,36 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: volcast-ingest
+  # Replace with your GCP region
+  annotations:
+    run.googleapis.com/launch-stage: GA
+spec:
+  template:
+    spec:
+      # Retry once on failure before marking job failed
+      maxRetries: 1
+      template:
+        spec:
+          # Use a dedicated service account with GCS + Secret Manager permissions
+          serviceAccountName: volcast-ingest-sa@PROJECT_ID.iam.gserviceaccount.com
+          timeoutSeconds: 3600
+          containers:
+            - image: gcr.io/PROJECT_ID/volcast-ingest:latest
+              resources:
+                limits:
+                  cpu: "2"
+                  memory: 4Gi
+              env:
+                - name: GCS_BUCKET
+                  value: volcast-data
+                - name: SUPABASE_URL
+                  valueFrom:
+                    secretKeyRef:
+                      name: supabase-url
+                      key: latest
+                - name: SUPABASE_KEY
+                  valueFrom:
+                    secretKeyRef:
+                      name: supabase-key
+                      key: latest

@@ -1,0 +1,52 @@
+name: Deploy Ingest Job
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "dags/ingest_job.py"
+      - "src/scraping.py"
+      - "src/convert_data.py"
+      - "Dockerfile.job"
+      - "requirements.job.txt"
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/volcast-ingest
+  JOB_NAME: volcast-ingest
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker --quiet
+
+      - name: Build image
+        run: docker build -f Dockerfile.job -t $IMAGE:$GITHUB_SHA -t $IMAGE:latest .
+
+      - name: Push image
+        run: |
+          docker push $IMAGE:$GITHUB_SHA
+          docker push $IMAGE:latest
+
+      - name: Update Cloud Run Job
+        run: |
+          gcloud run jobs update $JOB_NAME \
+            --region $REGION \
+            --image $IMAGE:$GITHUB_SHA \
+            --project $PROJECT_ID

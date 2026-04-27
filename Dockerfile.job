@@ -1,0 +1,18 @@
+FROM python:3.12-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.job.txt .
+RUN pip install --no-cache-dir -r requirements.job.txt
+
+COPY src/scraping.py    src/scraping.py
+COPY src/convert_data.py src/convert_data.py
+COPY dags/ingest_job.py dags/ingest_job.py
+
+ENV PYTHONUNBUFFERED=1
+
+CMD ["python", "dags/ingest_job.py"]

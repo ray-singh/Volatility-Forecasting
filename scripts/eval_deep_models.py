@@ -22,7 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))  # bare 'deep_models' alias for pkl compat
 
 from src.config import PipelineConfig
-from src.engineer import build_features, feature_cols, clean
+from src.engineer import build_features, feature_cols, deep_feature_cols, clean
 from src.dataset import make_splits
 
 
@@ -76,15 +76,19 @@ def build_test_splits(force_rebuild: bool = False):
     if CACHE_PATH.exists() and not force_rebuild:
         print(f"Loading cached test split from {CACHE_PATH} ...")
         cache = np.load(CACHE_PATH, allow_pickle=True)
-        from src.dataset import Splits
-        splits = Splits(
-            X_train=cache["X_train"],
-            X_val=cache["X_val"],
-            X_test=cache["X_test"],
-            y_rv={k: v for k, v in zip(cache["y_rv_keys"], cache["y_rv_vals"])},
-            y_shock_spread={k: v for k, v in zip(cache["y_shock_keys"], cache["y_shock_vals"])},
-        )
-        return splits, cfg
+        if "fcols" not in cache:
+            print("  Cache missing fcols — rebuilding...")
+        else:
+            from src.dataset import Splits
+            splits = Splits(
+                X_train=cache["X_train"],
+                X_val=cache["X_val"],
+                X_test=cache["X_test"],
+                y_rv={k: v for k, v in zip(cache["y_rv_keys"], cache["y_rv_vals"])},
+                y_shock_spread={k: v for k, v in zip(cache["y_shock_keys"], cache["y_shock_vals"])},
+            )
+            fcols = list(cache["fcols"])
+            return splits, cfg, fcols
 
     data_path = Path("data/orderbook/btcusd_full.parquet")
     if not data_path.exists():
@@ -93,6 +97,8 @@ def build_test_splits(force_rebuild: bool = False):
     import polars as pl
     print("Reading parquet...")
     raw_df = pl.read_parquet(data_path)
+    raw_df = raw_df[-10000000:]   # match Kaggle training slice
+
 
     print("Building features (this takes a few minutes)...")
     feat_df = build_features(
@@ -132,9 +138,10 @@ def build_test_splits(force_rebuild: bool = False):
         y_rv_vals=np.array([splits.y_rv[k] for k in splits.y_rv], dtype=object),
         y_shock_keys=np.array(list(splits.y_shock_spread.keys())),
         y_shock_vals=np.array([splits.y_shock_spread[k] for k in splits.y_shock_spread], dtype=object),
+        fcols=np.array(fcols),
     )
 
-    return splits, cfg
+    return splits, cfg, fcols
 
 
 # ── main ──────────────────────────────────────────────────────────────────────
@@ -148,7 +155,12 @@ def main():
                         help="Force rebuild of feature matrix even if cache exists")
     args = parser.parse_args()
 
-    splits, cfg = build_test_splits(force_rebuild=args.rebuild)
+    splits, cfg, fcols = build_test_splits(force_rebuild=args.rebuild)
+
+    import polars as pl
+    _dummy = pl.DataFrame({c: [0.0] for c in fcols})
+    deep_fcols = deep_feature_cols(_dummy, har_lags=cfg.features.har_lags, lob_levels=cfg.data.lob_levels)
+    deep_idx   = [fcols.index(c) for c in deep_fcols]
 
     results_path = Path("results.json")
     results = json.loads(results_path.read_text()) if results_path.exists() else {}
@@ -173,7 +185,7 @@ def main():
             print(f"  Horizon {horizon_key} not in splits, skipping.")
             continue
 
-        X_test  = splits.X_test
+        X_test  = splits.X_test[:, deep_idx]
         y_rv    = splits.y_rv[horizon_key]["test"]
         y_shock = splits.y_shock_spread[horizon_key]["test"]
 
