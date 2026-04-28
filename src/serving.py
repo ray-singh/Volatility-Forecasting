@@ -79,6 +79,9 @@ def _download_from_gcs() -> None:
         for blob in blobs:
             if not blob.name.endswith(".pkl"):
                 continue
+            filename = Path(blob.name).name
+            if not filename.startswith("lgbm_"):
+                continue
             dest = Path(blob.name)
             dest.parent.mkdir(parents=True, exist_ok=True)
             blob.download_to_filename(str(dest))

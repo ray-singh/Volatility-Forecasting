@@ -64,8 +64,8 @@ def evaluate_rv_forecast(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
     QLIKE is computed on variance (squared RV), not volatility, following
     Patton (2011). Input arrays should be volatility (standard deviation).
     """
-    rmse  = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
-    mae   = float(np.mean(np.abs(y_true - y_pred)))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+    mae = float(np.mean(np.abs(y_true - y_pred)))
 
     # QLIKE: convert RV (volatility) to variance, then compute
     # QLIKE(h, sigma^2) = h / sigma^2 - log(h / sigma^2) - 1
@@ -160,7 +160,7 @@ def label_regimes(feat_df_test: pl.DataFrame) -> pl.DataFrame:
     Regime is "high" if the value exceeds the test-set median, "low" otherwise.
     Using the test-set median avoids train→test leakage of threshold values.
     """
-    rv_median  = float(feat_df_test["rv_50"].median())
+    rv_median = float(feat_df_test["rv_50"].median())
     spd_median = float(feat_df_test["spread"].median())
     return feat_df_test.with_columns([
         pl.when(pl.col("rv_50") > rv_median)
@@ -215,11 +215,11 @@ def run_feature_ablation(
     Returns dict keyed by group name (and "_baseline") with RV metrics
     and delta_rmse vs. baseline.
     """
-    y_rv_tr  = splits.y_rv[horizon_key]["train"]
-    y_rv_va  = splits.y_rv[horizon_key]["val"]
-    y_rv_te  = splits.y_rv[horizon_key]["test"]
-    y_sh_tr  = splits.y_shock_spread[horizon_key]["train"]
-    y_sh_va  = splits.y_shock_spread[horizon_key]["val"]
+    y_rv_tr = splits.y_rv[horizon_key]["train"]
+    y_rv_va = splits.y_rv[horizon_key]["val"]
+    y_rv_te = splits.y_rv[horizon_key]["test"]
+    y_sh_tr = splits.y_shock_spread[horizon_key]["train"]
+    y_sh_va = splits.y_shock_spread[horizon_key]["val"]
 
     # Baseline with all features
     base = LGBMDualModel(lgbm_params=lgbm_params)
@@ -227,7 +227,7 @@ def run_feature_ablation(
         splits.X_train, y_rv_tr, y_sh_tr,
         X_val=splits.X_val, y_rv_val=y_rv_va, y_shock_val=y_sh_va,
     )
-    base_pred    = base.predict_rv(splits.X_test)
+    base_pred = base.predict_rv(splits.X_test)
     base_metrics = evaluate_rv_forecast(y_rv_te, base_pred)
 
     ablation = {"_baseline": base_metrics}
@@ -245,7 +245,7 @@ def run_feature_ablation(
         m = LGBMDualModel(lgbm_params=lgbm_params)
         m.fit(X_tr, y_rv_tr, y_sh_tr, X_val=X_va, y_rv_val=y_rv_va, y_shock_val=y_sh_va)
         pred = m.predict_rv(X_te)
-        met  = evaluate_rv_forecast(y_rv_te, pred)
+        met = evaluate_rv_forecast(y_rv_te, pred)
         ablation[group_name] = {
             **met,
             "delta_rmse": met["rmse"] - base_metrics["rmse"],
@@ -298,7 +298,7 @@ def train(
     cfg.models.lgbm_params["seed"] = seed
 
     horizons = cfg.features.horizons
-    tps      = cfg.features.ticks_per_second
+    tps = cfg.features.ticks_per_second
 
     mlflow.set_experiment(EXPERIMENT_NAME)
 
@@ -340,7 +340,7 @@ def train(
             levels=cfg.data.lob_levels,
             poll_interval_s=0.5,
         )
-        raw_df    = loader.load(n_rows=max_rows)
+        raw_df = loader.load(n_rows=max_rows)
         load_time = time.perf_counter() - t0
 
         _log(f"Source:      {cfg.data.source}")
@@ -366,7 +366,7 @@ def train(
             ticks_per_second=tps,
             lob_levels=cfg.data.lob_levels,
         )
-        fcols    = feature_cols(feat_df, har_lags=cfg.features.har_lags,
+        fcols = feature_cols(feat_df, har_lags=cfg.features.har_lags,
                                 lob_levels=cfg.data.lob_levels)
         eng_time = time.perf_counter() - t0
 
@@ -394,19 +394,19 @@ def train(
             [f"target_shock_depth_{h}s"   for h in horizons
              if f"target_shock_depth_{h}s" in feat_df.columns]
         )
-        all_cols    = fcols + target_cols
+        all_cols = fcols + target_cols
         rows_before = len(feat_df)
-        feat_df     = clean(feat_df, all_cols)
-        rows_after  = len(feat_df)
-        dropped     = rows_before - rows_after
+        feat_df = clean(feat_df, all_cols)
+        rows_after = len(feat_df)
+        dropped = rows_before - rows_after
 
         _log(f"Rows before: {rows_before:,}")
         _log(f"Rows after:  {rows_after:,}  ({dropped:,} dropped, "
              f"{dropped / rows_before * 100:.1f}%)")
 
         for h in horizons:
-            rv_s  = feat_df[f"target_rv_{h}s"]
-            sk_s  = feat_df[f"target_shock_spread_{h}s"]
+            rv_s = feat_df[f"target_rv_{h}s"]
+            sk_s = feat_df[f"target_shock_spread_{h}s"]
             vj_col = f"target_vol_jump_{h}s"
             _log(f"  target_rv_{h}s      mean={rv_s.mean():.6f}  std={rv_s.std():.6f}")
             _log(f"  shock_spread_{h}s   rate={sk_s.mean():.3f}")
@@ -441,10 +441,10 @@ def train(
         # Slim feature matrix for sequence models — drop rolling stats redundant with context
         deep_fcols = deep_feature_cols(feat_df, har_lags=cfg.features.har_lags,
                                        lob_levels=cfg.data.lob_levels)
-        deep_idx   = [fcols.index(c) for c in deep_fcols]
+        deep_idx = [fcols.index(c) for c in deep_fcols]
         X_train_deep = splits.X_train[:, deep_idx]
-        X_val_deep   = splits.X_val[:,   deep_idx]
-        X_test_deep  = splits.X_test[:,  deep_idx]
+        X_val_deep = splits.X_val[:, deep_idx]
+        X_test_deep = splits.X_test[:, deep_idx]
         _log(f"Deep model features ({len(deep_fcols)}): {deep_fcols}")
         _log(f"Train:    {n_train:,} rows  ({n_train / rows_after * 100:.1f}%)")
         _log(f"Val:      {n_val:,} rows  ({n_val / rows_after * 100:.1f}%)")
@@ -463,12 +463,12 @@ def train(
         t0 = time.perf_counter()
         har_cols = [c for c in fcols if c.startswith("har_rv_")]
         if har_cols:
-            har_idx     = [fcols.index(c) for c in har_cols]
+            har_idx = [fcols.index(c) for c in har_cols]
             X_har_train = splits.X_train[:, har_idx]
-            X_har_test  = splits.X_test[:, har_idx]
+            X_har_test = splits.X_test[:, har_idx]
         else:
             X_har_train = np.ones((n_train, 1))
-            X_har_test  = np.ones((n_test, 1))
+            X_har_test = np.ones((n_test, 1))
 
         _log(f"HAR features: {har_cols or ['intercept-only']}")
         har = HARRVModel()
@@ -571,8 +571,8 @@ def train(
             )
             lgbm_models[key] = lgbm
 
-            lgbm_rv_pred_test   = lgbm.predict_rv(splits.X_test)
-            lgbm_shock_proba    = lgbm.predict_shock_proba(splits.X_test)
+            lgbm_rv_pred_test = lgbm.predict_rv(splits.X_test)
+            lgbm_shock_proba = lgbm.predict_shock_proba(splits.X_test)
             lgbm_shock_proba_val = lgbm.predict_shock_proba(splits.X_val)
 
             lgbm_shock_proba_calib = calibrate_shock_probabilities(
@@ -582,7 +582,7 @@ def train(
                 lgbm_shock_proba,
             )
 
-            lgbm_rv_metrics[key]    = evaluate_rv_forecast(splits.y_rv[key]["test"], lgbm_rv_pred_test)
+            lgbm_rv_metrics[key] = evaluate_rv_forecast(splits.y_rv[key]["test"], lgbm_rv_pred_test)
             lgbm_shock_metrics[key] = evaluate_shock_forecast(splits.y_shock_spread[key]["test"], lgbm_shock_proba)
             lgbm_shock_metrics_calib[key] = evaluate_shock_forecast(splits.y_shock_spread[key]["test"], lgbm_shock_proba_calib)
             lgbm_rv_preds[key] = lgbm_rv_pred_test
@@ -609,9 +609,9 @@ def train(
         # 8. TCN (optional, one horizon)
         # ─────────────────────────────────────────────────────────────────────
         tcn = None
-        tcn_rv_metrics    = None
+        tcn_rv_metrics = None
         tcn_shock_metrics = None
-        tcn_key           = f"{seq_horizon_s}s"
+        tcn_key = f"{seq_horizon_s}s"
 
         if train_tcn and tcn_key in splits.y_rv:
             _section(f"8. TCN Model ({tcn_key} horizon)")
@@ -638,9 +638,9 @@ def train(
             )
             mlflow.start_run(run_id=run_id)
 
-            tcn_time           = time.perf_counter() - t0
-            tcn_rv_pred_test   = tcn.predict_rv(X_test_deep)
-            tcn_shock_proba    = tcn.predict_shock_proba(X_test_deep)
+            tcn_time = time.perf_counter() - t0
+            tcn_rv_pred_test = tcn.predict_rv(X_test_deep)
+            tcn_shock_proba = tcn.predict_shock_proba(X_test_deep)
             tcn_shock_proba_val = tcn.predict_shock_proba(X_val_deep)
 
             # Calibrate shock probabilities using validation set
@@ -651,10 +651,10 @@ def train(
                 tcn_shock_proba
             )
 
-            tcn_rv_metrics     = evaluate_rv_forecast(
+            tcn_rv_metrics = evaluate_rv_forecast(
                 splits.y_rv[tcn_key]["test"], tcn_rv_pred_test
             )
-            tcn_shock_metrics  = evaluate_shock_forecast(
+            tcn_shock_metrics = evaluate_shock_forecast(
                 splits.y_shock_spread[tcn_key]["test"], tcn_shock_proba
             )
             tcn_shock_metrics_calib = evaluate_shock_forecast(
@@ -684,9 +684,9 @@ def train(
         # 9. Transformer (optional, one horizon)
         # ─────────────────────────────────────────────────────────────────────
         transformer = None
-        transformer_rv_metrics    = None
+        transformer_rv_metrics = None
         transformer_shock_metrics = None
-        transformer_key           = tcn_key
+        transformer_key = tcn_key
 
         if train_transformer and transformer_key in splits.y_rv:
             _section(f"9. Transformer Model ({transformer_key} horizon)")
@@ -719,9 +719,9 @@ def train(
             )
             mlflow.start_run(run_id=run_id)
 
-            transformer_time           = time.perf_counter() - t0
-            transformer_rv_pred_test   = transformer.predict_rv(X_test_deep)
-            transformer_shock_proba    = transformer.predict_shock_proba(X_test_deep)
+            transformer_time = time.perf_counter() - t0
+            transformer_rv_pred_test = transformer.predict_rv(X_test_deep)
+            transformer_shock_proba = transformer.predict_shock_proba(X_test_deep)
             transformer_shock_proba_val = transformer.predict_shock_proba(X_val_deep)
 
             transformer_shock_proba_calib = calibrate_shock_probabilities(
@@ -731,7 +731,7 @@ def train(
                 transformer_shock_proba,
             )
 
-            transformer_rv_metrics    = evaluate_rv_forecast(
+            transformer_rv_metrics = evaluate_rv_forecast(
                 splits.y_rv[transformer_key]["test"], transformer_rv_pred_test
             )
             transformer_shock_metrics = evaluate_shock_forecast(
@@ -775,12 +775,12 @@ def train(
 
         if lgbm_rv_preds and "rv_50" in feat_df_test.columns and "spread" in feat_df_test.columns:
             feat_df_test = label_regimes(feat_df_test)
-            vol_labels    = feat_df_test["vol_regime"].to_numpy()
+            vol_labels = feat_df_test["vol_regime"].to_numpy()
             spread_labels = feat_df_test["spread_regime"].to_numpy()
 
             # Evaluate LGBM on primary horizon by regime
             lgbm_rv_pred_primary = lgbm_rv_preds[primary_key]
-            y_rv_te_primary      = splits.y_rv[primary_key]["test"]
+            y_rv_te_primary = splits.y_rv[primary_key]["test"]
             n_common = min(len(y_rv_te_primary), len(vol_labels),
                           len(lgbm_rv_pred_primary))
 
@@ -863,13 +863,13 @@ def train(
 
             if tcn is not None and tcn_key == primary_key:
                 tcn_rv_pred_test_prim = tcn.predict_rv(splits.X_test)
-                dm_tcn_vs_har  = diebold_mariano(y_rv_te, har_pred_test[:len(y_rv_te)],
+                dm_tcn_vs_har = diebold_mariano(y_rv_te, har_pred_test[:len(y_rv_te)],
                                                  tcn_rv_pred_test_prim[:len(y_rv_te)])
                 dm_tcn_vs_lgbm = diebold_mariano(y_rv_te, lgbm_rv_preds[primary_key],
                                                  tcn_rv_pred_test_prim[:len(y_rv_te)])
                 _print_dm("TCN vs HAR",  dm_tcn_vs_har)
                 _print_dm("TCN vs LGBM", dm_tcn_vs_lgbm)
-                dm_results["tcn_vs_har"]  = dm_tcn_vs_har
+                dm_results["tcn_vs_har"] = dm_tcn_vs_har
                 dm_results["tcn_vs_lgbm"] = dm_tcn_vs_lgbm
         else:
             _log("Skipped (LGBM not trained)")
@@ -962,6 +962,23 @@ def train(
             json.dump(results, f, indent=2)
         mlflow.log_artifact(str(results_path))
         _log(f"Saved {results_path}")
+
+        # ── Upload models + results.json to GCS (if GCS_BUCKET is set) ───────
+        gcs_bucket = os.environ.get("GCS_BUCKET", "")
+        if gcs_bucket:
+            _section("14. Upload to GCS")
+            try:
+                from google.cloud import storage as _gcs
+                gcs_client = _gcs.Client()
+                bucket = gcs_client.bucket(gcs_bucket)
+
+                upload_paths = list(models_dir.glob("*.pkl")) + [results_path]
+                for local_path in upload_paths:
+                    blob_name = str(local_path)
+                    bucket.blob(blob_name).upload_from_filename(str(local_path))
+                    _log(f"Uploaded gs://{gcs_bucket}/{blob_name}")
+            except Exception as exc:
+                _log(f"GCS upload failed (continuing): {exc}")
 
         # ─────────────────────────────────────────────────────────────────────
         # Summary table

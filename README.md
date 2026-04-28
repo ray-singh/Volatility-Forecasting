@@ -8,6 +8,7 @@ An end-to-end market microstructure research pipeline for forecasting short-hori
 - **Classification**: detects liquidity shocks — bid-ask spread expansions and depth depletions
 - **Live feed**: streams real-time LOB snapshots from Kraken/Bybit WebSocket APIs
 - **Dashboard**: Streamlit app with feature analysis, model comparison, and live inference
+- **Cloud serving**: FastAPI inference API on Cloud Run (scale-to-zero); nightly ingest job on Cloud Run Jobs
 
 ## Models
 
@@ -33,11 +34,14 @@ An end-to-end market microstructure research pipeline for forecasting short-hori
 
 ```mermaid
 flowchart TD
-    subgraph Ingest["Data Ingestion"]
+    subgraph Ingest["Data Ingestion  ·  Cloud Run Job (nightly)"]
         K[kraken_feed.py\nWebSocket / REST]
         B[bybit.py\nWebSocket]
+        SC[scraping.py\nCloud Run Job]
         K --> CSV[data/csv/\nLOB snapshots]
         B --> PQ[data/orderbook/\nparquet]
+        SC --> GCS[(GCS\nvolcast-ray-volcast-prod)]
+        SC --> SB[(Supabase\ningest_log)]
     end
 
     subgraph Prep["Preprocessing"]
@@ -45,6 +49,7 @@ flowchart TD
         CP --> MP[make_parquet.py]
         MP --> PAR[(parquet)]
         PQ --> PAR
+        GCS --> PAR
     end
 
     subgraph FE["Feature Engineering  ·  src/engineer.py"]
@@ -61,7 +66,7 @@ flowchart TD
         DS --> TE[Test]
     end
 
-    subgraph Models["Models"]
+    subgraph Models["Models  ·  src/train.py"]
         TR & VA --> HAR[HAR-RV\nOLS baseline]
         TR & VA --> GARCH[GARCH\nbaseline]
         TR & VA --> LGBM[LightGBM\nRV + shock]
@@ -69,22 +74,20 @@ flowchart TD
         TR & VA --> TFM[Transformer\nPyTorch]
     end
 
-    subgraph Eval["Evaluation  ·  src/train.py · src/evaluate_deep.py · src/backtest.py"]
+    subgraph Eval["Evaluation"]
         HAR & GARCH & LGBM & TCN & TFM --> TE
         TE --> RJ[results.json]
         TE --> ML[(MLflow\nexperiment DB)]
         TE --> BT[backtest_results.json\nwalk-forward CV + MM PnL]
+        RJ --> GCS
+        LGBM --> GCS
     end
 
     subgraph Serve["Serving & Visualisation"]
-        RJ --> API[src/serving.py\nFastAPI  :8000]
+        GCS --> API[src/serving.py\nFastAPI · Cloud Run\nvolcast-serve-....run.app]
         RJ --> UI[app.py\nStreamlit dashboard]
         API --> UI
         PAR --> UI
-    end
-
-    subgraph Sched["Automation"]
-        PLIST[com.volcast.retrain.plist\nlaunchd  03:00 nightly] --> TR
     end
 ```
 
@@ -98,18 +101,34 @@ flowchart TD
 │   ├── dataset.py              # Train/val/test splits (70/15/15 chronological)
 │   ├── models.py               # LightGBM wrapper + DataLoader
 │   ├── deep_models.py          # TCN and Transformer (PyTorch)
-│   ├── train.py                # Full training pipeline + MLflow logging
+│   ├── train.py                # Full training pipeline + MLflow logging + GCS upload
 │   ├── backtest.py             # Walk-forward backtest + market-making PnL simulation
 │   ├── evaluate_deep.py        # Post-hoc evaluation of saved deep model pkl files
-│   ├── serving.py              # FastAPI inference server (:8000)
+│   ├── serving.py              # FastAPI inference server (Cloud Run / local :8000)
+│   ├── scraping.py             # Cloud Run Job: scrape, upload parquet to GCS, log to Supabase
 │   ├── kraken_feed.py          # Kraken WebSocket live feed
 │   ├── bybit.py                # Bybit WebSocket live feed
 │   ├── make_parquet.py         # Convert raw CSVs to parquet
 │   └── convert_data.py         # Data format utilities
-├── models/                     # Saved model pkl files (git-ignored)
+├── deploy/
+│   ├── cloudrun_job.yaml       # Cloud Run Job spec (nightly ingest)
+│   ├── cloudrun_serve.yaml     # Cloud Run Service spec (FastAPI, scale-to-zero)
+│   ├── cloudbuild.yaml         # Cloud Build: training job image
+│   ├── cloudbuild_serve.yaml   # Cloud Build: serving image
+│   ├── supabase_schema.sql     # Supabase ingest_log table DDL
+│   └── scheduler.sh            # Cloud Scheduler setup script
+├── .github/workflows/
+│   ├── deploy_job.yml          # CI: push ingest job image on merge
+│   └── deploy_serve.yml        # CI: push serving image on merge
+├── Dockerfile                  # Full training image
+├── Dockerfile.job              # Ingest job image (no torch)
+├── Dockerfile.serve            # Serving image (no torch)
+├── requirements.txt            # Full deps (training + dashboard)
+├── requirements.job.txt        # Ingest job deps
+├── requirements.serve.txt      # Serving deps (LightGBM + FastAPI only)
+├── models/                     # Saved model pkl files (git-ignored; source of truth is GCS)
 ├── data/orderbook/             # Training data (btcusd_full.parquet, 5.5M rows)
-├── results.json                # Evaluation metrics (patched by train.py / evaluate_deep.py)
-└── com.volcast.retrain.plist   # launchd nightly retraining schedule
+└── results.json                # Evaluation metrics (patched by train.py / evaluate_deep.py)
 ```
 
 ## Quickstart
@@ -118,7 +137,7 @@ flowchart TD
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 
-# Train all models
+# Train all models (uploads lgbm_model_*.pkl + results.json to GCS if GCS_BUCKET is set)
 python -m src.train --source parquet --path data/orderbook/btcusd_full.parquet
 
 # Walk-forward backtest (5 folds, 5s horizon) — outputs backtest_results.json
@@ -129,6 +148,29 @@ python -m src.evaluate_deep
 
 # Launch dashboard
 streamlit run app.py
+
+# Run inference API locally
+uvicorn src.serving:app --host 0.0.0.0 --port 8000
+```
+
+## Cloud infrastructure (GCP)
+
+All production workloads run on Google Cloud Platform.
+
+| Component | Service | Notes |
+|---|---|---|
+| Ingest job | Cloud Run Jobs | Nightly scrape → GCS + Supabase metadata log |
+| Training | Cloud Run Jobs | Triggered manually or via Cloud Scheduler |
+| Inference API | Cloud Run (scale-to-zero) | `volcast-serve-3988143537.us-central1.run.app` |
+| Model storage | GCS `volcast-ray-volcast-prod` | `models/lgbm_model_*.pkl`, `results.json` |
+| Metadata | Supabase `ingest_log` | Date, row count, GCS path, status per ingest run |
+| CI/CD | GitHub Actions + Workload Identity | Pushes images to GCR, deploys on merge to `main` |
+
+### Model lifecycle
+
+1. `src/train.py` trains LightGBM models and saves `models/lgbm_model_{1s,5s,30s}.pkl` + `results.json`
+2. At end of training, all pkl files and `results.json` are uploaded to `gs://volcast-ray-volcast-prod/`
+3. At Cloud Run startup, `src/serving.py` downloads only `lgbm_model_*.pkl` files from GCS (deep model pkls are skipped — no torch in the serving image)
 ```
 
 ## Walk-forward backtest
@@ -162,22 +204,14 @@ Also outputs a **market-making PnL simulation** per fold — the MM quotes when 
 | `target_vol_jump_{h}s` | RV exceeds µ + 2σ of trailing 300-tick window (sharper shock signal) |
 | `target_shock_depth_{h}s` | Depth ratio drops below Q25 within horizon (binary) |
 
-## Nightly retraining
-
-A launchd plist (`com.volcast.retrain.plist`) schedules nightly retraining at 03:00:
-
-```bash
-cp com.volcast.retrain.plist ~/Library/LaunchAgents/
-launchctl load ~/Library/LaunchAgents/com.volcast.retrain.plist
-# Logs: tail -f /tmp/volcast_retrain.log
-```
-
 ## Stack
 
 - **Data**: Polars, PyArrow
 - **ML**: LightGBM, PyTorch (MPS/CUDA/CPU)
 - **Tracking**: MLflow
-- **API**: FastAPI + Uvicorn
+- **API**: FastAPI + Uvicorn on Cloud Run
 - **Dashboard**: Streamlit
 - **Live data**: Kraken & Bybit WebSocket APIs
-- **Containerization**: Docker & Docker Compose
+- **Storage**: GCS (model artifacts + parquet), Supabase (ingest metadata)
+- **CI/CD**: GitHub Actions + GCP Workload Identity Federation
+- **Containerization**: Docker (3 images: training, ingest job, serving)

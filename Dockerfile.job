@@ -9,9 +9,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.job.txt .
 RUN pip install --no-cache-dir -r requirements.job.txt
 
-COPY src/scraping.py    src/scraping.py
 COPY src/convert_data.py src/convert_data.py
-COPY dags/ingest_job.py dags/ingest_job.py
+COPY src/__init__.py     src/__init__.py
+COPY dags/ingest_job.py  dags/ingest_job.py
 
 ENV PYTHONUNBUFFERED=1
 

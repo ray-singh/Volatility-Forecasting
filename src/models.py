@@ -14,19 +14,23 @@ They are re-exported here for backward compatibility.
 from __future__ import annotations
 
 import numpy as np
-# torch must be imported before lightgbm — both ship libomp and the one
-# loaded first wins; importing lgb first causes a segfault during torch
-# backward() on macOS.
-import torch
 import polars as pl
 from statsmodels.regression.linear_model import OLS
 import lightgbm as lgb
 
-# Re-export deep models so existing imports from models.py continue to work
-from .deep_models import (  # noqa: F401
-    TCNModel,
-    TransformerModel,
-)
+def _import_deep_models():
+    # torch must be imported before lightgbm — both ship libomp and the one
+    # loaded first wins; importing lgb first causes a segfault during torch
+    # backward() on macOS. Only import when deep models are actually needed.
+    import torch  # noqa: F401
+    from .deep_models import TCNModel, TransformerModel
+    return TCNModel, TransformerModel
+
+def __getattr__(name):
+    if name in ("TCNModel", "TransformerModel"):
+        TCNModel, TransformerModel = _import_deep_models()
+        return TCNModel if name == "TCNModel" else TransformerModel
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
