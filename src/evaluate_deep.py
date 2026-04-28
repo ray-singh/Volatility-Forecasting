@@ -60,8 +60,8 @@ def main():
 
     cfg = PipelineConfig()
     lob_levels = args.lob_levels or cfg.data.lob_levels
-    horizons   = cfg.features.horizons   # e.g. [1, 5, 30]
-    tps        = cfg.features.ticks_per_second
+    horizons = cfg.features.horizons   # e.g. [1, 5, 30]
+    tps = cfg.features.ticks_per_second
 
     # ── 1. Load data (same as train.py) ───────────────────────────────────────
     print("Loading data…")
@@ -141,26 +141,26 @@ def main():
             if key not in splits.y_rv:
                 continue
 
-            y_rv_test    = splits.y_rv[key]["test"]
+            y_rv_test = splits.y_rv[key]["test"]
             y_shock_test = splits.y_shock_spread[key]["test"]
-            y_shock_val  = splits.y_shock_spread[key]["val"]
+            y_shock_val = splits.y_shock_spread[key]["val"]
 
             # Trim features to match what the model's scaler was fit on
             n_model_feats = model.scaler.n_features_in_
             X_test_m = splits.X_test[:, :n_model_feats]
-            X_val_m  = splits.X_val[:, :n_model_feats]
+            X_val_m = splits.X_val[:, :n_model_feats]
 
             try:
-                rv_pred        = model.predict_rv(X_test_m)
-                shock_proba    = model.predict_shock_proba(X_test_m)
+                rv_pred = model.predict_rv(X_test_m)
+                shock_proba = model.predict_shock_proba(X_test_m)
                 shock_proba_val = model.predict_shock_proba(X_val_m)
             except Exception as e:
                 print(f"  [{name} {key}] predict failed: {e} — skipping")
                 continue
 
-            rv_metrics    = evaluate_rv_forecast(y_rv_test, rv_pred)
+            rv_metrics = evaluate_rv_forecast(y_rv_test, rv_pred)
             shock_metrics = evaluate_shock_forecast(y_shock_test, shock_proba)
-            shock_calib   = calibrate_shock_probabilities(
+            shock_calib = calibrate_shock_probabilities(
                 y_shock_val, shock_proba_val, y_shock_test, shock_proba
             )
             shock_metrics_calib = evaluate_shock_forecast(y_shock_test, shock_calib)
@@ -179,7 +179,7 @@ def main():
         primary = "5s" if "5s" in splits.y_rv else f"{horizons[0]}s"
         if primary in per_horizon and rv_key in per_horizon[primary]:
             flat_prefix = name.lower().replace(" ", "_")  # "tcn" or "transformer"
-            results[f"{flat_prefix}_rmse"]  = float(per_horizon[primary][rv_key]["rmse"])
+            results[f"{flat_prefix}_rmse"] = float(per_horizon[primary][rv_key]["rmse"])
             results[f"{flat_prefix}_auroc"] = float(per_horizon[primary][sh_key]["auroc"])
             results[f"{flat_prefix}_auprc"] = float(per_horizon[primary][sh_key]["auprc"])
             results[f"{flat_prefix}_brier"] = float(per_horizon[primary][sh_key]["brier"])

@@ -224,7 +224,7 @@ def _book_to_row(bids: dict, asks: dict, levels: int) -> dict[str, Any] | None:
             row[f"ask_p{i}"], row[f"ask_q{i}"] = float("nan"), 0.0
 
     row["mid_price"] = (sorted_bids[0][0] + sorted_asks[0][0]) / 2.0
-    row["spread"]    = sorted_asks[0][0] - sorted_bids[0][0]
+    row["spread"] = sorted_asks[0][0] - sorted_bids[0][0]
     row["last_trade_qty"] = None
 
     bid_depth = sum(q for _, q in sorted_bids)
@@ -380,17 +380,17 @@ class KrakenWSStream:
     ):
         from collections import deque
         import threading
-        self.pair   = pair
+        self.pair = pair
         self.levels = levels
         self.symbol = _WS_SYMBOL_MAP.get(pair, pair.replace("USD", "/USD"))
         self.snapshot_deque: deque = deque(maxlen=maxlen)
-        self._stop_event   = threading.Event()
+        self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
-        self._persist_path    = persist_path
-        self._flush_every     = flush_every
+        self._persist_path = persist_path
+        self._flush_every = flush_every
         self._unflushed: list[dict] = []
-        self._flush_lock      = threading.Lock()
-        self._rows_persisted  = 0
+        self._flush_lock = threading.Lock()
+        self._rows_persisted = 0
 
     def start(self):
         """Start background thread (idempotent — safe to call multiple times)."""

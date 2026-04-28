@@ -41,7 +41,7 @@ from .train import evaluate_rv_forecast, evaluate_shock_forecast
 class Fold:
     idx: int
     train_slice: tuple[int, int]   # [start, end)
-    test_slice:  tuple[int, int]   # [start, end)
+    test_slice: tuple[int, int]   # [start, end)
 
 
 def walk_forward_folds(
@@ -79,7 +79,7 @@ def walk_forward_folds(
     for i in range(n_folds):
         train_end = min_train + i * fold_size
         test_start = train_end
-        test_end   = min(test_start + fold_size, n)
+        test_end = min(test_start + fold_size, n)
         if test_start >= n:
             break
         yield Fold(
@@ -200,27 +200,27 @@ class BacktestResult:
     folds: list[FoldResult] = field(default_factory=list)
 
     # Aggregates (populated by summarise())
-    rmse_mean:  float = 0.0
-    rmse_std:   float = 0.0
-    mae_mean:   float = 0.0
+    rmse_mean: float = 0.0
+    rmse_std: float = 0.0
+    mae_mean: float = 0.0
     auroc_mean: float = 0.0
-    auroc_std:  float = 0.0
+    auroc_std: float = 0.0
     sharpe_mean: float = 0.0
-    total_pnl:  float = 0.0
+    total_pnl: float = 0.0
 
     def summarise(self) -> BacktestResult:
-        rmses  = [f.rv_metrics["rmse"]    for f in self.folds]
-        maes   = [f.rv_metrics["mae"]     for f in self.folds]
+        rmses = [f.rv_metrics["rmse"] for f in self.folds]
+        maes = [f.rv_metrics["mae"] for f in self.folds]
         aurocs = [f.shock_metrics["auroc"] for f in self.folds]
         sharpes = [f.pnl["sharpe"]        for f in self.folds]
 
-        self.rmse_mean   = float(np.mean(rmses))
-        self.rmse_std    = float(np.std(rmses, ddof=1))
-        self.mae_mean    = float(np.mean(maes))
-        self.auroc_mean  = float(np.mean(aurocs))
-        self.auroc_std   = float(np.std(aurocs, ddof=1))
+        self.rmse_mean = float(np.mean(rmses))
+        self.rmse_std = float(np.std(rmses, ddof=1))
+        self.mae_mean = float(np.mean(maes))
+        self.auroc_mean = float(np.mean(aurocs))
+        self.auroc_std = float(np.std(aurocs, ddof=1))
         self.sharpe_mean = float(np.mean(sharpes))
-        self.total_pnl   = float(sum(f.pnl["total_pnl"] for f in self.folds))
+        self.total_pnl = float(sum(f.pnl["total_pnl"] for f in self.folds))
         return self
 
     def to_dict(self) -> dict:
@@ -293,8 +293,8 @@ def run_backtest(
     BacktestResult with per-fold and aggregate metrics.
     """
     horizon_key = f"{horizon_s}s"
-    rv_col      = f"target_rv_{horizon_s}s"
-    shock_col   = f"target_shock_spread_{horizon_s}s"
+    rv_col = f"target_rv_{horizon_s}s"
+    shock_col = f"target_shock_spread_{horizon_s}s"
 
     if rv_col not in feat_df.columns:
         raise ValueError(f"Target column '{rv_col}' not in dataframe. "
@@ -310,7 +310,7 @@ def run_backtest(
             "verbosity":       -1,
         }
 
-    X    = np.ascontiguousarray(feat_df.select(fcols).to_numpy())
+    X = np.ascontiguousarray(feat_df.select(fcols).to_numpy())
     y_rv = feat_df[rv_col].to_numpy().ravel()
     y_sh = feat_df[shock_col].to_numpy().ravel() if shock_col in feat_df.columns else np.zeros(len(X))
     spread_arr = feat_df["spread"].to_numpy().ravel() if "spread" in feat_df.columns else np.ones(len(X))
@@ -332,19 +332,19 @@ def run_backtest(
         te_s, te_e = fold.test_slice
 
         X_train = X[tr_s:tr_e]
-        X_test  = X[te_s:te_e]
+        X_test = X[te_s:te_e]
         y_rv_train = y_rv[tr_s:tr_e]
-        y_rv_test  = y_rv[te_s:te_e]
+        y_rv_test = y_rv[te_s:te_e]
         y_sh_train = y_sh[tr_s:tr_e]
-        y_sh_test  = y_sh[te_s:te_e]
+        y_sh_test = y_sh[te_s:te_e]
         spread_test = spread_arr[te_s:te_e]
 
         # Use the last 15% of training as a validation set for early stopping
         val_split = int(len(X_train) * 0.85)
-        X_val_fold  = X_train[val_split:]
-        y_rv_val_f  = y_rv_train[val_split:]
-        y_sh_val_f  = y_sh_train[val_split:]
-        X_train_f   = X_train[:val_split]
+        X_val_fold = X_train[val_split:]
+        y_rv_val_f = y_rv_train[val_split:]
+        y_sh_val_f = y_sh_train[val_split:]
+        X_train_f = X_train[:val_split]
         y_rv_train_f = y_rv_train[:val_split]
         y_sh_train_f = y_sh_train[:val_split]
 
@@ -356,14 +356,14 @@ def run_backtest(
         )
         fit_time = time.perf_counter() - t0
 
-        rv_pred    = model.predict_rv(X_test)
-        sh_proba   = model.predict_shock_proba(X_test)
+        rv_pred = model.predict_rv(X_test)
+        sh_proba = model.predict_shock_proba(X_test)
 
         # Mask NaNs in targets
         rv_mask = np.isfinite(y_rv_test) & np.isfinite(rv_pred)
         sh_mask = np.isfinite(y_sh_test) & rv_mask
 
-        rv_metrics    = evaluate_rv_forecast(y_rv_test[rv_mask], rv_pred[rv_mask])
+        rv_metrics = evaluate_rv_forecast(y_rv_test[rv_mask], rv_pred[rv_mask])
         shock_metrics = (
             evaluate_shock_forecast(y_sh_test[sh_mask].astype(int), sh_proba[sh_mask])
             if sh_mask.sum() > 10 and len(np.unique(y_sh_test[sh_mask])) == 2
@@ -464,10 +464,10 @@ def main():
     fcols = feature_cols(feat_df, har_lags=cfg.features.har_lags,
                          lob_levels=cfg.data.lob_levels)
 
-    rv_col    = f"target_rv_{args.horizon}s"
+    rv_col = f"target_rv_{args.horizon}s"
     shock_col = f"target_shock_spread_{args.horizon}s"
-    all_cols  = fcols + [c for c in [rv_col, shock_col, "spread"] if c in feat_df.columns]
-    feat_df   = clean(feat_df, all_cols)
+    all_cols = fcols + [c for c in [rv_col, shock_col, "spread"] if c in feat_df.columns]
+    feat_df = clean(feat_df, all_cols)
 
     result = run_backtest(
         feat_df,

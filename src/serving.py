@@ -12,6 +12,7 @@ Usage:
 Environment variables:
     MODEL_DIR   — directory containing *.pkl model files (default: models/)
     LOB_LEVELS  — number of LOB price levels in incoming snapshots (default: 5)
+    GCS_BUCKET  — if set, download models/*.pkl and results.json from GCS at startup
 """
 from __future__ import annotations
 
@@ -32,9 +33,10 @@ from .engineer import build_features, clean, feature_cols
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-MODEL_DIR  = Path(os.getenv("MODEL_DIR",  "models"))
-LOB_LEVELS = int(os.getenv("LOB_LEVELS",  "5"))
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "models"))
+LOB_LEVELS = int(os.getenv("LOB_LEVELS", "5"))
 RESULTS_PATH = Path("results.json")
+GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 
 _feat_cfg = FeatureConfig()
 
@@ -51,7 +53,48 @@ class _ModuleRemapUnpickler(pickle.Unpickler):
         return super().find_class(module, name)
 
 
+def _download_from_gcs() -> None:
+    """Download models/*.pkl and results.json from GCS into local directories."""
+    if not GCS_BUCKET:
+        return
+    try:
+        from google.cloud import storage as _gcs
+        import google.oauth2.service_account as _sa
+
+        gcp_creds_json = os.getenv("GOOGLE_CREDENTIALS", "")
+        if gcp_creds_json:
+            import json as _json
+            info = _json.loads(gcp_creds_json)
+            creds = _sa.Credentials.from_service_account_info(
+                info, scopes=["https://www.googleapis.com/auth/cloud-platform"]
+            )
+            client = _gcs.Client(credentials=creds, project=info.get("project_id"))
+        else:
+            client = _gcs.Client()
+        bucket = client.bucket(GCS_BUCKET)
+
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+        blobs = list(bucket.list_blobs(prefix="models/"))
+        for blob in blobs:
+            if not blob.name.endswith(".pkl"):
+                continue
+            dest = Path(blob.name)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            blob.download_to_filename(str(dest))
+            print(f"[serving] Downloaded {blob.name}")
+
+        results_blob = bucket.blob("results.json")
+        if results_blob.exists():
+            results_blob.download_to_filename(str(RESULTS_PATH))
+            print("[serving] Downloaded results.json")
+
+    except Exception as exc:
+        print(f"[serving] GCS download failed (continuing): {exc}")
+
+
 def _load_models() -> None:
+    _download_from_gcs()
     for h in ("1s", "5s", "30s"):
         path = MODEL_DIR / f"lgbm_model_{h}.pkl"
         if path.exists():
@@ -212,7 +255,7 @@ def predict(req: PredictRequest) -> PredictResponse:
     for horizon, model in _models.items():
         try:
             rv_val = float(np.clip(model.predict_rv(last_row)[0], 0, None))
-            proba  = model.predict_shock_proba(last_row)[0]
+            proba = model.predict_shock_proba(last_row)[0]
             shock_p = float(proba[1]) if len(proba) > 1 else float(proba[0])
             predictions[horizon] = HorizonPrediction(
                 rv=rv_val,

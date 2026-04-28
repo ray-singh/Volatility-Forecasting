@@ -136,9 +136,9 @@ def build_features(
         )
         # Near-touch (levels 0–1) vs far (levels 3–4) depth ratio
         near_bid = [f"bid_q{i}" for i in range(2) if f"bid_q{i}" in df.columns]
-        far_bid  = [f"bid_q{i}" for i in range(3, 5) if f"bid_q{i}" in df.columns]
+        far_bid = [f"bid_q{i}" for i in range(3, 5) if f"bid_q{i}" in df.columns]
         near_ask = [f"ask_q{i}" for i in range(2) if f"ask_q{i}" in df.columns]
-        far_ask  = [f"ask_q{i}" for i in range(3, 5) if f"ask_q{i}" in df.columns]
+        far_ask = [f"ask_q{i}" for i in range(3, 5) if f"ask_q{i}" in df.columns]
         if near_bid and far_bid:
             df = df.with_columns(
                 (
@@ -304,7 +304,7 @@ def build_features(
     # these MUST be recomputed on the training slice only to avoid lookahead bias.
     # See dataset.py:make_splits for the correct implementation.
     spread_threshold = float(df["spread"].quantile(0.75))
-    depth_threshold  = (
+    depth_threshold = (
         float(df["depth_ratio"].quantile(0.25))
         if "depth_ratio" in df.columns else None
     )
@@ -312,7 +312,7 @@ def build_features(
     # Rolling RV stats for vol-jump shock threshold (computed once, full series)
     # dataset.py recomputes on train slice only — these serve as initialisation.
     _rv_roll_mean = df["rv_50"].rolling_mean(window_size=300)
-    _rv_roll_std  = df["rv_50"].rolling_std(window_size=300)
+    _rv_roll_std = df["rv_50"].rolling_std(window_size=300)
 
     for h_s in horizons:
         h_ticks = max(1, int(round(h_s * ticks_per_second)))
@@ -553,7 +553,7 @@ def clean(df: pl.DataFrame, cols: list[str]) -> pl.DataFrame:
     pl.DataFrame
     """
     float_cols = [c for c in cols if c in df.columns and df[c].dtype in (pl.Float32, pl.Float64)]
-    other_cols  = [c for c in cols if c in df.columns and df[c].dtype not in (pl.Float32, pl.Float64)]
+    other_cols = [c for c in cols if c in df.columns and df[c].dtype not in (pl.Float32, pl.Float64)]
 
     # For float columns: replace both inf and NaN with null
     df = df.with_columns([

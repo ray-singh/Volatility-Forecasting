@@ -51,20 +51,20 @@ class _SequenceDataset(torch.utils.data.Dataset):
     """
 
     def __init__(self, X: np.ndarray, y_rv: np.ndarray, y_shock: np.ndarray, seq_len: int):
-        self.X       = X
-        self.y_rv    = y_rv
+        self.X = X
+        self.y_rv = y_rv
         self.y_shock = y_shock
         self.seq_len = seq_len
-        self.n       = len(X) - seq_len
+        self.n = len(X) - seq_len
 
     def __len__(self) -> int:
         return max(self.n, 0)
 
     def __getitem__(self, idx: int):
-        x_seq   = torch.from_numpy(
+        x_seq = torch.from_numpy(
             np.ascontiguousarray(self.X[idx: idx + self.seq_len])
         ).float()
-        y_rv    = torch.tensor(self.y_rv[idx + self.seq_len],    dtype=torch.float32)
+        y_rv = torch.tensor(self.y_rv[idx + self.seq_len], dtype=torch.float32)
         y_shock = torch.tensor(self.y_shock[idx + self.seq_len], dtype=torch.int64)
         return x_seq, y_rv, y_shock
 
@@ -114,12 +114,12 @@ class _SequenceModel:
         total_loss = rv_total = shock_total = 0.0
         with torch.set_grad_enabled(train):
             for X_batch, y_rv_batch, y_shock_batch in loader:
-                X_batch       = X_batch.to(self.device)
-                y_rv_batch    = y_rv_batch.to(self.device)
+                X_batch = X_batch.to(self.device)
+                y_rv_batch = y_rv_batch.to(self.device)
                 y_shock_batch = y_shock_batch.to(self.device)
 
                 rv_pred, shock_pred = self.net(X_batch)
-                rv_loss    = rv_criterion(rv_pred.squeeze(1), y_rv_batch)
+                rv_loss = rv_criterion(rv_pred.squeeze(1), y_rv_batch)
                 shock_loss = shock_criterion(shock_pred, y_shock_batch)
                 loss = rv_loss_weight * rv_loss + shock_loss_weight * shock_loss
 
@@ -130,8 +130,8 @@ class _SequenceModel:
                     optimizer.step()
 
                 n = len(X_batch)
-                total_loss  += loss.item()    * n
-                rv_total    += rv_loss.item() * n
+                total_loss += loss.item() * n
+                rv_total += rv_loss.item() * n
                 shock_total += shock_loss.item() * n
 
         d = len(loader.dataset)
@@ -148,12 +148,12 @@ class _SequenceModel:
         n = len(X_s)
         dummy_y = np.zeros(n)
         dataset = _SequenceDataset(X_s, dummy_y, dummy_y, self.seq_len)
-        loader  = TorchDataLoader(
+        loader = TorchDataLoader(
             dataset, batch_size=self.batch_size, shuffle=False, num_workers=0
         )
 
         self.net.eval()
-        rv_out    = []
+        rv_out = []
         shock_out = []
         with torch.no_grad():
             for X_batch, _, _ in loader:
@@ -162,12 +162,12 @@ class _SequenceModel:
                 rv_out.append(rv_pred.squeeze(1).cpu().numpy())
                 shock_out.append(torch.softmax(shock_pred, dim=1).cpu().numpy())
 
-        rv_preds_valid    = np.concatenate(rv_out)
+        rv_preds_valid = np.concatenate(rv_out)
         shock_proba_valid = np.concatenate(shock_out)
 
         # Invert log-scaling + standardization applied during training
         rv_log_shift = getattr(self, "_rv_log_shift", 0.0)
-        rv_log_std   = getattr(self, "_rv_log_std",   1.0)
+        rv_log_std = getattr(self, "_rv_log_std", 1.0)
         rv_preds_valid = np.exp(rv_preds_valid * rv_log_std + rv_log_shift)
 
         rv_preds = np.empty(n)
@@ -200,16 +200,16 @@ class _SequenceModel:
     ):
         """Shared training loop with early stopping and best-weights restore."""
         X_train_s = self.scaler.fit_transform(X_train)
-        X_val_s   = self.scaler.transform(X_val) if X_val is not None else None
+        X_val_s = self.scaler.transform(X_val) if X_val is not None else None
 
         # Log-scale + standardize RV targets so MSE operates on unit-variance values.
         # Without standardization, log-RV std≈4.2 → init MSE≈18, very slow convergence.
         rv_eps = 1e-8
         log_rv_train = np.log(np.clip(y_rv_train, rv_eps, None))
         self._rv_log_shift = float(log_rv_train.mean())
-        self._rv_log_std   = float(log_rv_train.std()) or 1.0
+        self._rv_log_std = float(log_rv_train.std()) or 1.0
         y_rv_train_s = (log_rv_train - self._rv_log_shift) / self._rv_log_std
-        y_rv_val_s   = (
+        y_rv_val_s = (
             (np.log(np.clip(y_rv_val, rv_eps, None)) - self._rv_log_shift) / self._rv_log_std
             if y_rv_val is not None else None
         )
@@ -230,7 +230,7 @@ class _SequenceModel:
             if len(X_val_s) > self.seq_len:
                 val_loader = self._make_loader(X_val_s, y_rv_val_s, y_shock_val, shuffle=False)
 
-        train_loader    = self._make_loader(X_train_s, y_rv_train_s, y_shock_train, shuffle=True)
+        train_loader = self._make_loader(X_train_s, y_rv_train_s, y_shock_train, shuffle=True)
         no_decay = {"bias", "norm", "LayerNorm"}
         param_groups = [
             {"params": [p for n, p in self.net.named_parameters()
@@ -239,9 +239,9 @@ class _SequenceModel:
                         if any(nd in n for nd in no_decay)],     "weight_decay": 0.0},
         ]
         optimizer = torch.optim.AdamW(param_groups, lr=lr)
-        rv_criterion    = nn.MSELoss()
+        rv_criterion = nn.MSELoss()
         shock_criterion = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
-        
+
         def _lr_lambda(epoch: int) -> float:
             if epoch < warmup_epochs:
                 return (epoch + 1) / warmup_epochs
@@ -252,7 +252,7 @@ class _SequenceModel:
 
         best_val_loss = float("inf")
         epochs_no_imp = 0
-        best_state    = None
+        best_state = None
         self.train_history: list[dict] = []
 
         for epoch in range(1, epochs + 1):
@@ -327,10 +327,10 @@ class _TCNBlock(nn.Module):
         pad = (kernel_size - 1) * dilation
         self.conv1 = nn.Conv1d(in_ch, out_ch, kernel_size, padding=pad, dilation=dilation)
         self.conv2 = nn.Conv1d(out_ch, out_ch, kernel_size, padding=pad, dilation=dilation)
-        self.drop  = nn.Dropout(dropout)
-        self.relu  = nn.ReLU()
+        self.drop = nn.Dropout(dropout)
+        self.relu = nn.ReLU()
         self.downsample = nn.Conv1d(in_ch, out_ch, 1) if in_ch != out_ch else None
-        self._pad  = pad
+        self._pad = pad
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.conv1(x)
@@ -362,12 +362,12 @@ class _TCNNet(nn.Module):
             dilation = 2 ** i
             layers.append(_TCNBlock(in_ch, out_ch, kernel_size, dilation, dropout))
             in_ch = out_ch
-        self.network        = nn.Sequential(*layers)
+        self.network = nn.Sequential(*layers)
         self.rv_head_linear = nn.Linear(channels[-1], 1)
-        self.shock_head     = nn.Sequential(
+        self.shock_head = nn.Sequential(
             nn.Linear(channels[-1], 16), nn.ReLU(), nn.Linear(16, 2)
         )
-        nn.init.zeros_(self.rv_head_linear.weight)
+        nn.init.normal_(self.rv_head_linear.weight, std=0.01)
         nn.init.zeros_(self.rv_head_linear.bias)
         nn.init.zeros_(self.shock_head[-1].weight)
         nn.init.zeros_(self.shock_head[-1].bias)
@@ -411,18 +411,18 @@ class TCNModel(_SequenceModel):
         device: str | None = None,
     ):
         # 5-layer dilation stack: receptive field = 125 ticks ≈ 62s at 2 ticks/s
-        self.channels          = channels or [32, 64, 128, 128, 128]
-        self.kernel_size       = kernel_size
-        self.dropout           = dropout
-        self.seq_len           = seq_len
-        self.epochs            = epochs
-        self.batch_size        = batch_size
-        self.lr                = lr
-        self.rv_loss_weight    = rv_loss_weight
+        self.channels = channels or [32, 64, 128, 128, 128]
+        self.kernel_size = kernel_size
+        self.dropout = dropout
+        self.seq_len = seq_len
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.rv_loss_weight = rv_loss_weight
         self.shock_loss_weight = shock_loss_weight
-        self.patience          = patience
-        self.device            = _get_device(device)
-        self.scaler            = StandardScaler()
+        self.patience = patience
+        self.device = _get_device(device)
+        self.scaler = StandardScaler()
         self.net: _TCNNet | None = None
         self.train_history: list[dict] = []
 
@@ -436,7 +436,7 @@ class TCNModel(_SequenceModel):
         y_shock_val: np.ndarray | None = None,
     ) -> TCNModel:
         input_size = X_train.shape[1]
-        self.net   = _TCNNet(input_size, self.channels, self.kernel_size, self.dropout)
+        self.net = _TCNNet(input_size, self.channels, self.kernel_size, self.dropout)
         rf = _TCNNet.receptive_field(self.channels, self.kernel_size)
         print(f"[TCN] channels={self.channels}  kernel={self.kernel_size}  "
               f"receptive_field={rf} ticks")
@@ -497,8 +497,8 @@ class _TransformerNet(nn.Module):
         self.input_proj = nn.Linear(input_size, d_model)
         # Learnable positional encoding — more flexible than sinusoidal for
         # non-uniform tick rates and short sequences
-        self.pos_emb    = nn.Embedding(seq_len + 1, d_model)  # +1 for CLS token
-        self.cls_token  = nn.Parameter(torch.zeros(1, 1, d_model))
+        self.pos_emb = nn.Embedding(seq_len + 1, d_model)  # +1 for CLS token
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, d_model))
 
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
@@ -513,7 +513,7 @@ class _TransformerNet(nn.Module):
         # RV head predicts log-RV (targets are log-scaled in _fit_loop); no
         # positive activation needed since _predict_raw applies exp() to invert.
         self.rv_head_linear = nn.Linear(d_model, 1)
-        self.shock_head     = nn.Sequential(
+        self.shock_head = nn.Sequential(
             nn.Linear(d_model, 32), nn.ReLU(), nn.Dropout(dropout), nn.Linear(32, 2)
         )
 
@@ -604,22 +604,22 @@ class TransformerModel(_SequenceModel):
         device: str | None = None,
     ):
         assert d_model % nhead == 0, f"d_model ({d_model}) must be divisible by nhead ({nhead})"
-        self.d_model           = d_model
-        self.nhead             = nhead
-        self.num_layers        = num_layers
-        self.dim_feedforward   = dim_feedforward
-        self.dropout           = dropout
-        self.seq_len           = seq_len
-        self.epochs            = epochs
-        self.batch_size        = batch_size
-        self.lr                = lr
-        self.rv_loss_weight    = rv_loss_weight
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_layers = num_layers
+        self.dim_feedforward = dim_feedforward
+        self.dropout = dropout
+        self.seq_len = seq_len
+        self.epochs = epochs
+        self.batch_size = batch_size
+        self.lr = lr
+        self.rv_loss_weight = rv_loss_weight
         self.shock_loss_weight = shock_loss_weight
-        self.patience          = patience
-        self.warmup_epochs     = warmup_epochs
-        self.label_smoothing   = label_smoothing
-        self.device            = _get_device(device)
-        self.scaler            = StandardScaler()
+        self.patience = patience
+        self.warmup_epochs = warmup_epochs
+        self.label_smoothing = label_smoothing
+        self.device = _get_device(device)
+        self.scaler = StandardScaler()
         self.net: _TransformerNet | None = None
         self.train_history: list[dict] = []
 

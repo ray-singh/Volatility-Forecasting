@@ -16,23 +16,22 @@ import json
 import os
 import zipfile
 from datetime import date, timedelta
-
 import pandas as pd
 import requests
 from tqdm import tqdm
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-SYMBOL      = "BTCUSD"          # Bybit inverse perpetual (USD-settled)
+SYMBOL = "BTCUSD"          # Bybit inverse perpetual (USD-settled)
 # For USDT-settled linear perpetual use "BTCUSDT"
 
-OUTPUT_FMT  = "parquet"         # "parquet" or "csv"
-OUTPUT_DIR  = f"./data/orderbook/{SYMBOL}"
+OUTPUT_FMT = "parquet"         # "parquet" or "csv"
+OUTPUT_DIR = f"./data/orderbook/{SYMBOL}"
 
 # Data mirror (quote-saver.bycsi.com) lags real-time by several months.
 # Default to a known-good window from 2025; override via CLI --start/--end.
-END_DATE    = date(2025, 8, 20)
-START_DATE  = END_DATE - timedelta(days=6)   # 7 days inclusive
+END_DATE = date(2025, 8, 20)
+START_DATE = END_DATE - timedelta(days=6)   # 7 days inclusive
 
 # Bybit public data base URL (inverse / linear perpetuals)
 BASE_URL = "https://quote-saver.bycsi.com/orderbook/inverse/{symbol}/{date}_{symbol}_ob500.data.zip"
@@ -99,7 +98,7 @@ def parse_ob_file(raw_bytes: bytes) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = pd.DataFrame(records)
-    df["ts"]  = pd.to_datetime(df["ts"],  unit="ms", utc=True)
+    df["ts"] = pd.to_datetime(df["ts"], unit="ms", utc=True)
     df["cts"] = pd.to_datetime(df["cts"], unit="ms", utc=True)
     return df
 
@@ -130,7 +129,7 @@ def main(
 
     for day in tqdm(list(date_range(start, end)), unit="day"):
         ds = day.strftime("%Y-%m-%d")
-        out_ext  = "parquet" if fmt == "parquet" else "csv"
+        out_ext = "parquet" if fmt == "parquet" else "csv"
         out_path = os.path.join(output_dir, f"{ds}_{symbol}_ob500.{out_ext}")
 
         if os.path.exists(out_path):
@@ -190,7 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("--fmt",    default=OUTPUT_FMT, choices=["parquet", "csv"])
     args = parser.parse_args()
 
-    end_date   = date.fromisoformat(args.end)
+    end_date = date.fromisoformat(args.end)
     start_date = date.fromisoformat(args.start) if args.start else end_date - timedelta(days=6)
 
     main(symbol=args.symbol, start=start_date, end=end_date, fmt=args.fmt)

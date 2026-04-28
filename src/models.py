@@ -339,10 +339,10 @@ def diebold_mariano(
 
     e1 = (y_true - y_pred1) ** 2
     e2 = (y_true - y_pred2) ** 2
-    d  = e1 - e2
+    d = e1 - e2
 
     mean_d = np.mean(d)
-    var_d  = np.var(d, ddof=1)
+    var_d = np.var(d, ddof=1)
     dm_stat = mean_d / np.sqrt(var_d / len(d))
     p_value = 2 * (1 - stats.norm.cdf(np.abs(dm_stat)))
 

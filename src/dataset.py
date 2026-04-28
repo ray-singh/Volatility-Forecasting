@@ -6,7 +6,6 @@ Supports multiple forecast horizons with per-horizon RV, spread shock,
 and depth depletion shock targets.
 """
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 import numpy as np
 import polars as pl
@@ -26,15 +25,15 @@ class Splits:
     compatibility and point to the 5s horizon when available, else 1s.
     """
     X_train: np.ndarray
-    X_val:   np.ndarray
-    X_test:  np.ndarray
+    X_val: np.ndarray
+    X_test: np.ndarray
 
     # Multi-horizon targets
-    y_rv:           dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
-    y_log_rv:       dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    y_rv: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    y_log_rv: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
     y_shock_spread: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
-    y_shock_depth:  dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
-    y_vol_jump:     dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    y_shock_depth: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
+    y_vol_jump: dict[str, dict[str, np.ndarray]] = field(default_factory=dict)
 
     # Feature column names (stored for ablation)
     feature_cols: list[str] = field(default_factory=list)
@@ -112,7 +111,7 @@ def make_splits(
 
     n = len(feat_df)
     train_end = int(n * train_frac)
-    val_end   = train_end + int(n * val_frac)
+    val_end = train_end + int(n * val_frac)
 
     # Compute thresholds on training slice only to avoid lookahead bias
     feat_df_train = feat_df.slice(0, train_end)
@@ -124,9 +123,9 @@ def make_splits(
 
     # Vol-jump threshold: µ + 2σ of training RV (300-tick rolling, evaluated at train end)
     rv_roll_mean_train = feat_df_train["rv_50"].rolling_mean(window_size=300)
-    rv_roll_std_train  = feat_df_train["rv_50"].rolling_std(window_size=300)
+    rv_roll_std_train = feat_df_train["rv_50"].rolling_std(window_size=300)
     _mean_at_end = float(rv_roll_mean_train[-1] or 0.0)
-    _std_at_end  = float(rv_roll_std_train[-1] or 0.0)
+    _std_at_end = float(rv_roll_std_train[-1] or 0.0)
     vol_jump_threshold_train = _mean_at_end + 2.0 * _std_at_end
 
     # Rebuild shock targets using training-only thresholds
@@ -167,14 +166,14 @@ def make_splits(
     # Feature matrix — contiguous for stride_tricks in sequence building
     X = np.ascontiguousarray(feat_df.select(feature_cols).to_numpy())
     X_train = X[:train_end].copy()
-    X_val   = X[train_end:val_end].copy()
-    X_test  = X[val_end:].copy()
+    X_val = X[train_end:val_end].copy()
+    X_test = X[val_end:].copy()
 
-    y_rv:           dict[str, dict[str, np.ndarray]] = {}
-    y_log_rv:       dict[str, dict[str, np.ndarray]] = {}
+    y_rv: dict[str, dict[str, np.ndarray]] = {}
+    y_log_rv: dict[str, dict[str, np.ndarray]] = {}
     y_shock_spread: dict[str, dict[str, np.ndarray]] = {}
-    y_shock_depth:  dict[str, dict[str, np.ndarray]] = {}
-    y_vol_jump:     dict[str, dict[str, np.ndarray]] = {}
+    y_shock_depth: dict[str, dict[str, np.ndarray]] = {}
+    y_vol_jump: dict[str, dict[str, np.ndarray]] = {}
 
     def _split(arr: np.ndarray) -> dict[str, np.ndarray]:
         return {

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: volcast-api
+    runtime: docker
+    dockerfilePath: Dockerfile.serve
+    plan: free
+    envVars:
+      - key: GCS_BUCKET
+        value: volcast-ray-volcast-prod
+      - key: LOB_LEVELS
+        value: "5"
+      - key: GOOGLE_CREDENTIALS
+        sync: false
