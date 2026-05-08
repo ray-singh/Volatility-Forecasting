@@ -5,7 +5,7 @@ import pandas as pd
 
 DATA_DIR = Path("data")
 OUT_DIR = DATA_DIR / "csv"
-OUT_DIR.mkdir(exist_ok=True)
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TOP_N = 5
 

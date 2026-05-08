@@ -1,6 +1,7 @@
 """
 Streamlit dashboard for volatility forecasting pipeline.
 """
+import io
 import os
 import pickle as _pickle
 import streamlit as st
@@ -13,6 +14,36 @@ from datetime import datetime
 from pathlib import Path
 import json
 from src.kraken_feed import KrakenWSStream
+from src.bybit_feed import BybitWSStream
+
+# ── GCS helpers ──────────────────────────────────────────────────────────────
+_GCS_BUCKET = os.environ.get("GCS_BUCKET", "")
+
+def _gcs_client():
+    from google.cloud import storage
+    return storage.Client()
+
+def _gcs_download_bytes(blob_name: str) -> bytes | None:
+    """Download a GCS blob as bytes. Returns None if bucket not configured or blob missing."""
+    if not _GCS_BUCKET:
+        return None
+    try:
+        bucket = _gcs_client().bucket(_GCS_BUCKET)
+        blob = bucket.blob(blob_name)
+        if not blob.exists():
+            return None
+        return blob.download_as_bytes()
+    except Exception:
+        return None
+
+def _gcs_list_blobs(prefix: str) -> list[str]:
+    """List blob names under a GCS prefix. Returns [] if bucket not configured."""
+    if not _GCS_BUCKET:
+        return []
+    try:
+        return [b.name for b in _gcs_client().list_blobs(_GCS_BUCKET, prefix=prefix)]
+    except Exception:
+        return []
 
 
 class _RemapUnpickler(_pickle.Unpickler):
@@ -31,15 +62,15 @@ st.set_page_config(
 )
 
 # ── Design tokens ───────────────────────────────────────────────────────────
-DARK_BG    = "#0d0f14"
-PANEL_BG   = "#13161e"
-BORDER     = "#1e2330"
-ACCENT     = "#4fffb0"        # neon-green
-ACCENT2    = "#7b6cff"        # violet
-WARN       = "#ff6b6b"
-TEXT_DIM   = "#6b7280"
-TEXT       = "#e2e8f0"
-FONT       = "'Inter', 'Roboto Mono', monospace"
+DARK_BG = "#0d0f14"
+PANEL_BG  = "#13161e"
+BORDER= "#1e2330"
+ACCENT= "#4fffb0"        # neon-green
+ACCENT2 = "#7b6cff"        # violet
+WARN = "#ff6b6b"
+TEXT_DIM  = "#6b7280"
+TEXT = "#e2e8f0"
+FONT = "'Inter', 'Roboto Mono', monospace"
 
 _AXIS_STYLE = dict(gridcolor=BORDER, zerolinecolor=BORDER,
                    tickfont=dict(color=TEXT_DIM, size=10))
@@ -261,19 +292,43 @@ def load_config():
 
 @st.cache_resource
 def load_trained_models():
-    try:
-        models_dir = Path("models")
-        models = {}
-        for f in models_dir.glob("*.pkl"):
-            with open(f, "rb") as fh:
-                models[f.stem] = _RemapUnpickler(fh).load()
-        return models or None
-    except Exception:
-        return None
+    models = {}
+    if _GCS_BUCKET:
+        for blob_name in _gcs_list_blobs("models/"):
+            if not blob_name.endswith(".pkl"):
+                continue
+            stem = blob_name[len("models/"):-len(".pkl")]
+            data = _gcs_download_bytes(blob_name)
+            if data is None:
+                continue
+            try:
+                models[stem] = _RemapUnpickler(io.BytesIO(data)).load()
+            except Exception:
+                pass
+    else:
+        try:
+            for f in Path("models").glob("*.pkl"):
+                with open(f, "rb") as fh:
+                    models[f.stem] = _RemapUnpickler(fh).load()
+        except Exception:
+            pass
+    return models or None
 
 
 def load_latest_data():
-    # Prefer CSV order-book files in data/csv/ (most recent day)
+    if _GCS_BUCKET:
+        blobs = sorted(_gcs_list_blobs("orderbook/"))
+        parquet_blobs = [b for b in blobs if b.endswith(".parquet")]
+        if parquet_blobs:
+            data = _gcs_download_bytes(parquet_blobs[-1])
+            if data is not None:
+                df = pl.read_parquet(io.BytesIO(data))
+                if "mid" in df.columns and "mid_price" not in df.columns:
+                    df = df.rename({"mid": "mid_price"})
+                return df
+        return None
+
+    # Local fallback
     csv_dir = Path("data/csv")
     if csv_dir.exists():
         csv_files = sorted(csv_dir.glob("order-book-*.csv"))
@@ -282,7 +337,6 @@ def load_latest_data():
             if "mid" in df.columns and "mid_price" not in df.columns:
                 df = df.rename({"mid": "mid_price"})
             return df
-    # Search all parquet files across known data dirs
     candidates = []
     for pattern in ("data/raw/*.parquet", "data/orderbook/*.parquet"):
         candidates.extend(Path().glob(pattern))
@@ -292,6 +346,11 @@ def load_latest_data():
 
 
 def load_results():
+    if _GCS_BUCKET:
+        data = _gcs_download_bytes("results.json")
+        if data is not None:
+            return json.loads(data)
+        return None
     p = Path("results.json")
     if p.exists():
         with open(p) as f:
@@ -307,7 +366,7 @@ def card(content: str, header: str = "") -> str:
 
 def metric_html(label: str, value: str, delta: str = "", delta_positive: bool = True) -> str:
     delta_class = "metric-delta-pos" if delta_positive else "metric-delta-neg"
-    delta_html  = f'<div class="{delta_class}">{delta}</div>' if delta else ""
+    delta_html = f'<div class="{delta_class}">{delta}</div>' if delta else ""
     return f"""
 <div class="metric-value">{value}</div>
 {delta_html}
@@ -320,11 +379,7 @@ def badge(text: str, style: str = "dim") -> str:
 
 
 # ── Navigation ───────────────────────────────────────────────────────────────
-# Backtest is compute-intensive — only expose it on local deployments.
-# Set VOLCAST_ENV=production in your server environment to hide it.
-_IS_LOCAL = os.environ.get("VOLCAST_ENV", "local").lower() != "production"
-
-NAV_PAGES = ["Features", "Models", "Live"] + (["Backtest"] if _IS_LOCAL else [])
+NAV_PAGES = ["Features", "Models", "Live"]
 
 def render_topbar():
     # Brand + nav as columns
@@ -367,8 +422,8 @@ def page_overview(df, results):
     panels = []
 
     if df is not None and len(df) > 0:
-        mid   = df["mid_price"][-1] if "mid_price" in df.columns else None
-        spd   = df["spread"].mean() if "spread" in df.columns else None
+        mid  = df["mid_price"][-1] if "mid_price" in df.columns else None
+        spd  = df["spread"].mean() if "spread" in df.columns else None
         n_obs = len(df)
         if "timestamp_ns" in df.columns:
             dur_s = (df["timestamp_ns"].max() - df["timestamp_ns"].min()) / 1e9
@@ -533,9 +588,9 @@ def page_order_book(df):
     # ── Depth chart
     st.markdown('<div class="section-title">Cumulative Depth</div>', unsafe_allow_html=True)
     bid_prices = [p for p, _ in bids]
-    bid_cumq   = list(np.cumsum([q for _, q in bids]))
+    bid_cumq  = list(np.cumsum([q for _, q in bids]))
     ask_prices = [p for p, _ in asks]
-    ask_cumq   = list(np.cumsum([q for _, q in asks]))
+    ask_cumq  = list(np.cumsum([q for _, q in asks]))
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
@@ -581,8 +636,9 @@ def page_features(df):
             har_lags=cfg.har_lags,
             horizons=cfg.horizons,
             ticks_per_second=cfg.ticks_per_second,
+            lob_levels=5,
         )
-        fcols   = feature_cols(feat_df, har_lags=cfg.har_lags)
+        fcols  = feature_cols(feat_df, har_lags=cfg.har_lags, lob_levels=5)
 
         if not fcols:
             _no_data_box("No feature columns found after engineering.")
@@ -592,7 +648,7 @@ def page_features(df):
         c_cols = st.columns(min(len(fcols), 5))
         for col, fc in zip(c_cols, fcols[:5]):
             if fc in feat_df.columns:
-                mu  = feat_df[fc].mean()
+                mu = feat_df[fc].mean()
                 std = feat_df[fc].std()
                 with col:
                     st.markdown(
@@ -656,25 +712,25 @@ def page_features(df):
 def _render_results_table(results: dict):
     # Pull 5s horizon (primary) from per_horizon if available, else fall back to flat legacy keys
     ph5 = (results.get("per_horizon") or {}).get("5s", {})
-    har_rmse  = ph5.get("har",  {}).get("rmse")  or results.get("har_rmse")
-    har_mae   = ph5.get("har",  {}).get("mae")   or results.get("har_mae")
+    har_rmse = ph5.get("har",  {}).get("rmse")  or results.get("har_rmse")
+    har_mae  = ph5.get("har",  {}).get("mae")   or results.get("har_mae")
     garch_rmse = ph5.get("garch", {}).get("rmse")
-    garch_mae  = ph5.get("garch", {}).get("mae")
+    garch_mae = ph5.get("garch", {}).get("mae")
     lgbm_rmse = ph5.get("lgbm_rv",    {}).get("rmse") or results.get("lgbm_rmse")
-    lgbm_mae  = ph5.get("lgbm_rv",    {}).get("mae")  or results.get("lgbm_mae")
+    lgbm_mae = ph5.get("lgbm_rv",    {}).get("mae")  or results.get("lgbm_mae")
     lgbm_auroc = ph5.get("lgbm_shock", {}).get("auroc") or results.get("auroc")
     lgbm_auprc = ph5.get("lgbm_shock", {}).get("auprc") or results.get("auprc")
     lgbm_brier = ph5.get("lgbm_shock", {}).get("brier") or results.get("brier")
-    tcn_rmse  = ph5.get("tcn_rv", {}).get("rmse") or results.get("tcn_rmse")
-    tcn_mae   = ph5.get("tcn_rv", {}).get("mae")
+    tcn_rmse = ph5.get("tcn_rv", {}).get("rmse") or results.get("tcn_rmse")
+    tcn_mae  = ph5.get("tcn_rv", {}).get("mae")
     tcn_auroc = ph5.get("tcn_shock", {}).get("auroc") or results.get("tcn_auroc")
     tcn_auprc = ph5.get("tcn_shock", {}).get("auprc") or results.get("tcn_auprc")
     tcn_brier = ph5.get("tcn_shock", {}).get("brier") or results.get("tcn_brier")
-    tr_rmse   = ph5.get("transformer_rv", {}).get("rmse") or results.get("transformer_rmse")
-    tr_mae    = ph5.get("transformer_rv", {}).get("mae")
-    tr_auroc  = ph5.get("transformer_shock", {}).get("auroc") or results.get("transformer_auroc")
-    tr_auprc  = ph5.get("transformer_shock", {}).get("auprc") or results.get("transformer_auprc")
-    tr_brier  = ph5.get("transformer_shock", {}).get("brier") or results.get("transformer_brier")
+    tr_rmse  = ph5.get("transformer_rv", {}).get("rmse") or results.get("transformer_rmse")
+    tr_mae = ph5.get("transformer_rv", {}).get("mae")
+    tr_auroc = ph5.get("transformer_shock", {}).get("auroc") or results.get("transformer_auroc")
+    tr_auprc = ph5.get("transformer_shock", {}).get("auprc") or results.get("transformer_auprc")
+    tr_brier = ph5.get("transformer_shock", {}).get("brier") or results.get("transformer_brier")
     rows = [
         ("HAR-RV",      har_rmse,  har_mae,  None,       None,       None),
         ("GARCH",       garch_rmse, garch_mae, None,      None,       None),
@@ -690,7 +746,7 @@ def _render_results_table(results: dict):
     # Find best per column
     rmse_vals = [r[1] for r in rows if r[1]]
     auroc_vals = [r[3] for r in rows if r[3]]
-    best_rmse  = min(rmse_vals)  if rmse_vals  else None
+    best_rmse = min(rmse_vals)  if rmse_vals  else None
     best_auroc = max(auroc_vals) if auroc_vals else None
 
     def cell(v, best, lower_is_better=True, fmt=".5f"):
@@ -739,7 +795,7 @@ def _render_multi_horizon(results: dict):
     # ── RMSE by horizon grouped bar
     st.markdown('<div class="section-title">RV Forecast RMSE by Horizon</div>',
                 unsafe_allow_html=True)
-    model_keys   = [("HAR-RV",      "har",            "#ffd166"),
+    model_keys  = [("HAR-RV",      "har",            "#ffd166"),
                     ("GARCH",       "garch",          WARN),
                     ("LightGBM",    "lgbm_rv",        ACCENT),
                     ("TCN",         "tcn_rv",         "#06d6a0"),
@@ -803,8 +859,8 @@ def _render_multi_horizon(results: dict):
             ("TCN",         "tcn_rv",          "tcn_shock"),
             ("Transformer", "transformer_rv",  "transformer_shock"),
         ]:
-            rv  = ph.get(rv_key, {})
-            sh  = ph.get(sh_key, {}) if sh_key else {}
+            rv = ph.get(rv_key, {})
+            sh = ph.get(sh_key, {}) if sh_key else {}
             if not rv:
                 continue
             tbl += (
@@ -840,7 +896,7 @@ def _render_regime_analysis(results: dict):
             rows = ""
             for regime_val, metrics in sorted(data.items()):
                 rmse = metrics.get("rmse", float("nan"))
-                mae  = metrics.get("mae",  float("nan"))
+                mae = metrics.get("mae",  float("nan"))
                 rows += (
                     f"<tr><td>{regime_val}</td>"
                     f"<td>{rmse:.6f}</td>"
@@ -861,7 +917,7 @@ def _render_regime_analysis(results: dict):
         if not data:
             continue
         labels = sorted(data.keys())
-        vals   = [data[r].get("rmse", 0) for r in labels]
+        vals  = [data[r].get("rmse", 0) for r in labels]
         colors = [WARN if r == "high" else ACCENT for r in labels]
         fig = go.Figure(go.Bar(
             x=labels, y=vals, marker_color=colors,
@@ -882,7 +938,7 @@ def _render_feature_ablation(results: dict):
         return
 
     baseline = ablation.get("_baseline", {})
-    groups   = {k: v for k, v in ablation.items() if k != "_baseline"}
+    groups  = {k: v for k, v in ablation.items() if k != "_baseline"}
 
     if not groups:
         _no_data_box("No ablation groups found.")
@@ -955,9 +1011,14 @@ def _render_latency_profiling():
                 module = f"src.{module}"
             return super().find_class(module, name)
 
-    def _load_model(path):
-        with open(path, "rb") as fh:
+    def _load_model(src):
+        """src: file path (Path) or raw bytes."""
+        fh = _io.BytesIO(src) if isinstance(src, (bytes, bytearray)) else open(src, "rb")
+        try:
             model = _SafeUnpickler(fh).load()
+        finally:
+            if not isinstance(src, (bytes, bytearray)):
+                fh.close()
         if hasattr(model, "device"):
             model.device = _torch.device(_device)
         if hasattr(model, "net") and model.net is not None:
@@ -978,10 +1039,21 @@ def _render_latency_profiling():
         )
         return
 
-    models_dir = Path("models")
-    pkl_files = sorted(models_dir.glob("*.pkl"))
-    if not pkl_files:
-        st.warning("No .pkl files found in models/")
+    # Build list of (stem, source) where source is bytes (GCS) or Path (local).
+    model_sources: list[tuple[str, "bytes | Path"]] = []
+    if _GCS_BUCKET:
+        for blob_name in sorted(_gcs_list_blobs("models/")):
+            if not blob_name.endswith(".pkl"):
+                continue
+            stem = blob_name[len("models/"):-len(".pkl")]
+            data = _gcs_download_bytes(blob_name)
+            if data is not None:
+                model_sources.append((stem, data))
+    if not model_sources:
+        for f in sorted(Path("models").glob("*.pkl")):
+            model_sources.append((f.stem, f))
+    if not model_sources:
+        st.warning("No .pkl files found in GCS or local models/")
         return
 
     results_rows = []
@@ -989,25 +1061,25 @@ def _render_latency_profiling():
     rng = np.random.default_rng(42)
 
     progress = st.progress(0.0, text="Benchmarking…")
-    for idx, pkl_path in enumerate(pkl_files):
+    for idx, (stem, src) in enumerate(model_sources):
         try:
-            model = _load_model(pkl_path)
+            model = _load_model(src)
         except Exception as e:
-            results_rows.append({"Model": pkl_path.stem, "RV p50 (ms)": "load error",
+            results_rows.append({"Model": stem, "RV p50 (ms)": "load error",
                                   "RV p99 (ms)": str(e), "Shock p50 (ms)": "—",
                                   "Shock p99 (ms)": "—", "Throughput (pred/s)": "—"})
             continue
 
         # LGBM: call booster_.predict directly (avoids sklearn force_all_finite compat error).
         # Deep: remap to CPU and run net forward directly.
-        rv_model   = getattr(model, "rv_model",    None)
-        sh_model   = getattr(model, "shock_model", None)
+        rv_model  = getattr(model, "rv_model",    None)
+        sh_model  = getattr(model, "shock_model", None)
         rv_booster = getattr(rv_model, "booster_", None)
         sh_booster = getattr(sh_model, "booster_", None)
-        net        = getattr(model,    "net",       None)
-        scaler     = getattr(model,    "scaler",    None)
+        net  = getattr(model,    "net",       None)
+        scaler= getattr(model,    "scaler",    None)
 
-        n_feat  = getattr(scaler, "n_features_in_", None) \
+        n_feat = getattr(scaler, "n_features_in_", None) \
                   or getattr(rv_model, "n_features_in_", None) or 54
         seq_len = getattr(model, "seq_len", 1)
 
@@ -1043,8 +1115,9 @@ def _render_latency_profiling():
             sh_times = rv_times  # single forward produces both heads; report same latency
 
         elif har_predict is not None:
-            # HAR-RV: statsmodels OLS, single-feature input
-            n_params = getattr(getattr(model, "model", None), "params", np.array([0])).shape[0]
+            # HAR-RV: params shape is (n_features,); X must be (n_samples, n_features).
+            params = getattr(model, "params", None)
+            n_params = params.shape[0] if params is not None else 55
             X_dummy = rng.standard_normal((1, n_params))
             for _ in range(warmup + n_runs):
                 t0 = _time.perf_counter()
@@ -1054,11 +1127,11 @@ def _render_latency_profiling():
 
         else:
             results_rows.append({
-                "Model": pkl_path.stem, "RV p50 (ms)": "unsupported",
+                "Model": stem, "RV p50 (ms)": "unsupported",
                 "RV p99 (ms)": "—", "Shock p50 (ms)": "—",
                 "Shock p99 (ms)": "—", "Throughput (pred/s)": "—",
             })
-            progress.progress((idx + 1) / len(pkl_files), text=f"Skipped {pkl_path.stem}")
+            progress.progress((idx + 1) / len(model_sources), text=f"Skipped {stem}")
             continue
 
         rv_timed = np.array(rv_times[warmup:]) * 1000  # ms
@@ -1072,15 +1145,14 @@ def _render_latency_profiling():
         tput = f"{n_runs / combined_s:,.0f}" if combined_s > 0 else "—"
 
         results_rows.append({
-            "Model":               pkl_path.stem,
+            "Model":               stem,
             "RV p50 (ms)":         _fmt(rv_timed, 50),
             "RV p99 (ms)":         _fmt(rv_timed, 99),
             "Shock p50 (ms)":      _fmt(sh_timed, 50) if len(sh_timed) else "N/A",
             "Shock p99 (ms)":      _fmt(sh_timed, 99) if len(sh_timed) else "N/A",
             "Throughput (pred/s)": tput,
         })
-        progress.progress((idx + 1) / len(pkl_files),
-                          text=f"Benchmarked {pkl_path.stem}")
+        progress.progress((idx + 1) / len(model_sources), text=f"Benchmarked {stem}")
 
     progress.empty()
 
@@ -1224,7 +1296,7 @@ def page_models(results):
             dm_rows = ""
             for pair, stats in dm.items():
                 better = stats.get("interpretation", "")
-                sig    = stats.get("p_value", 1) < 0.05
+                sig = stats.get("p_value", 1) < 0.05
                 b_html = badge("Significant", "green") if sig else badge("Not Significant", "dim")
                 dm_rows += (
                     f"<tr><td>{pair.replace('_vs_', ' vs ')}</td>"
@@ -1257,25 +1329,34 @@ def page_models(results):
 # ══════════════════════════════════════════════════════════════════════════════
 
 @st.cache_resource
-@st.cache_resource
 def _load_lgbm_models() -> dict:
-    """Load per-horizon LGBM models from models/. Returns {horizon: LGBMDualModel}."""
+    """Load per-horizon LGBM models. Pulls from GCS when GCS_BUCKET is set, else local."""
     models = {}
     for h in ("1s", "5s", "30s"):
-        p = Path(f"models/lgbm_model_{h}.pkl")
-        if p.exists():
-            with open(p, "rb") as fh:
-                models[h] = _RemapUnpickler(fh).load()
+        if _GCS_BUCKET:
+            data = _gcs_download_bytes(f"models/lgbm_model_{h}.pkl")
+            if data is not None:
+                try:
+                    models[h] = _RemapUnpickler(io.BytesIO(data)).load()
+                except Exception:
+                    pass
+        else:
+            p = Path(f"models/lgbm_model_{h}.pkl")
+            if p.exists():
+                with open(p, "rb") as fh:
+                    models[h] = _RemapUnpickler(fh).load()
     return models
 
 
-def _build_live_features(rows: list[dict]) -> "pl.DataFrame | None":
+def _build_live_features(rows: list[dict]) -> "tuple | None":
     """
     Run feature engineering on a list of raw LOB rows.
-    Returns None if there aren't enough rows to produce valid features.
+    Returns (feat_df, fcols) where feat_df retains all rows but NaN/inf cells
+    are replaced with 0 so the last row is always valid for prediction.
+    Returns None if feature engineering fails entirely.
     """
     try:
-        from src.engineer import build_features, feature_cols, clean
+        from src.engineer import build_features, feature_cols
         from src.config import FeatureConfig
         cfg = FeatureConfig()
         df = pl.DataFrame(rows)
@@ -1291,9 +1372,18 @@ def _build_live_features(rows: list[dict]) -> "pl.DataFrame | None":
         )
         fcols = feature_cols(feat_df, har_lags=cfg.har_lags, lob_levels=5)
         if not fcols:
-            st.warning("feature_cols() returned empty list")
             return None
-        feat_df = clean(feat_df, fcols)
+        # Replace null/NaN/inf with 0 for live inference — don't drop rows.
+        # Rolling windows produce Polars nulls (shift/rolling_*) and IEEE NaN
+        # (sqrt of near-zero sum); fill both so the last row is always valid.
+        float_fcols = [c for c in fcols if feat_df[c].dtype in (pl.Float32, pl.Float64)]
+        feat_df = feat_df.with_columns([
+            pl.when(pl.col(c).is_null() | pl.col(c).is_nan() | pl.col(c).is_infinite())
+              .then(pl.lit(0.0))
+              .otherwise(pl.col(c))
+              .alias(c)
+            for c in float_fcols
+        ])
         return feat_df, fcols
     except Exception as e:
         st.warning(f"Feature engineering failed: {e}")
@@ -1355,17 +1445,35 @@ def page_live():
     # ── Controls ──────────────────────────────────────────────────────────────
     col_ctl, col_status = st.columns([3, 2])
     with col_ctl:
-        pair = st.selectbox("Pair", ["XBTUSD"],
-                            key="live_pair")
+        exchange = st.selectbox("Exchange", ["Bybit (inverse)", "Kraken (spot)"],
+                                key="live_exchange")
+        is_bybit = exchange.startswith("Bybit")
+        pair = st.selectbox(
+            "Pair",
+            ["BTCUSD", "ETHUSD", "SOLUSD"] if is_bybit else ["XBTUSD", "ETHUSD"],
+            key="live_pair",
+        )
+        if not is_bybit:
+            st.warning(
+                "**Domain mismatch:** Models were trained on Bybit inverse-perpetual data. "
+                "Kraken spot microstructure (different spread regime, no funding rate) "
+                "is out-of-distribution — predictions may be unreliable.",
+                icon="⚠️",
+            )
+
+    def _make_stream(is_bybit, pair):
+        if is_bybit:
+            return BybitWSStream(symbol=pair, levels=5, maxlen=600)
+        return KrakenWSStream(pair=pair, levels=5, maxlen=600)
 
     # ── Stream lifecycle ──────────────────────────────────────────────────────
-    stream_key = f"live_stream_{pair}"
+    stream_key = f"live_stream_{exchange}_{pair}"
     if stream_key not in st.session_state:
         st.session_state[stream_key] = None
 
     # Auto-start stream on first visit
     if st.session_state[stream_key] is None or not st.session_state[stream_key].is_running:
-        stream = KrakenWSStream(pair=pair, levels=5, maxlen=600)
+        stream = _make_stream(is_bybit, pair)
         stream.start()
         st.session_state[stream_key] = stream
 
@@ -1375,7 +1483,7 @@ def page_live():
             s = st.session_state.get(stream_key)
             if s is not None:
                 s.stop()
-            stream = KrakenWSStream(pair=pair, levels=5, maxlen=600)
+            stream = _make_stream(is_bybit, pair)
             stream.start()
             st.session_state[stream_key] = stream
 
@@ -1387,13 +1495,15 @@ def page_live():
                 st.session_state[stream_key] = None
 
     stream = st.session_state.get(stream_key)
+    exch_label = "Bybit" if is_bybit else "Kraken"
     with col_status:
         if stream and stream.is_running:
-            n_rows     = len(stream.snapshot_deque)
-            persisted  = getattr(stream, "rows_persisted", 0)
+            n_rows = len(stream.snapshot_deque)
+            persisted = getattr(stream, "rows_persisted", 0)
             st.markdown(
                 f'<div class="info-box" style="margin-top:1.6rem;">'
                 f'<span style="color:{ACCENT}">● LIVE</span> &nbsp;·&nbsp; '
+                f'{exch_label} {pair} &nbsp;·&nbsp; '
                 f'{n_rows} in memory &nbsp;·&nbsp; '
                 f'<span style="color:{TEXT_DIM}">{persisted:,} saved to disk</span></div>',
                 unsafe_allow_html=True,
@@ -1406,8 +1516,15 @@ def page_live():
                 unsafe_allow_html=True,
             )
 
-    if stream is None or not stream.is_running or len(stream.snapshot_deque) < 10:
-        _no_data_box("Waiting for enough snapshots to start predictions (need ≥ 10)…")
+    n_snapshots = len(stream.snapshot_deque) if stream else 0
+    # rv_300 needs 300 ticks; require 310 so the last row has a full window.
+    _MIN_ROWS = 310
+    if stream is None or not stream.is_running or n_snapshots < _MIN_ROWS:
+        pct = int(n_snapshots / _MIN_ROWS * 100) if stream else 0
+        _no_data_box(
+            f"Warming up… {n_snapshots}/{_MIN_ROWS} snapshots "
+            f"({pct}%) — predictions appear once the 300-tick RV window fills."
+        )
         if stream and stream.is_running:
             st.rerun()
         return
@@ -1427,7 +1544,7 @@ def page_live():
     if not preds and feat_df is not None:
         preds = _predict_live(feat_df, fcols, lgbm_models)
 
-    mid    = latest.get("mid_price", 0)
+    mid = latest.get("mid_price", 0)
     spread = latest.get("spread", 0)
 
     kpi_cols = st.columns(2 + len(preds) * 2)
@@ -1440,7 +1557,7 @@ def page_live():
     for h in ("1s", "5s", "30s"):
         if h not in preds:
             continue
-        rv    = preds[h]["rv"]
+        rv = preds[h]["rv"]
         shock = preds[h]["shock_p"]
         shock_color = WARN if shock > 0.5 else ACCENT
         shock_label = "HIGH SHOCK" if shock > 0.5 else f"{shock:.1%}"
@@ -1506,7 +1623,7 @@ def page_live():
     st.markdown('<div class="section-title">Live Price & Spread</div>', unsafe_allow_html=True)
     n_chart = min(len(rows), 300)
     chart_rows = rows[-n_chart:]
-    mids    = [r["mid_price"] for r in chart_rows]
+    mids = [r["mid_price"] for r in chart_rows]
     spreads = [r["spread"]    for r in chart_rows]
     xs = list(range(len(chart_rows)))
 
@@ -1566,198 +1683,6 @@ def page_live():
         st.rerun()
 
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: BACKTEST
-# ══════════════════════════════════════════════════════════════════════════════
-def page_backtest():
-    from src.backtest import run_backtest
-    from src.engineer import build_features, feature_cols, clean
-    from src.models import DataLoader
-    from src.config import PipelineConfig
-
-    st.markdown('<div class="section-title">Walk-Forward Backtest</div>', unsafe_allow_html=True)
-    st.markdown(
-        f'<div class="info-box" style="margin-bottom:1rem;">'
-        f'Retrains LightGBM on each fold using only past data, then evaluates on the next unseen block. '
-        f'Also simulates a market-making strategy: quote normally when shock probability is low, sit out when it is high.'
-        f'</div>',
-        unsafe_allow_html=True,
-    )
-
-    cfg = PipelineConfig()
-
-    # ── Controls ────────────────────────────────────────────────────────────
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        source = st.selectbox("Data Source", ["csv", "parquet"], key="bt_source")
-    with c2:
-        horizon = st.selectbox("Horizon (s)", [1, 5, 30], index=1, key="bt_horizon")
-    with c3:
-        n_folds = st.slider("Folds", min_value=2, max_value=10, value=5, key="bt_folds")
-    with c4:
-        shock_threshold = st.slider("Shock Sit-Out Threshold", 0.1, 0.9, 0.5, 0.05, key="bt_thresh")
-
-    parquet_path = None
-    if source == "parquet":
-        parquet_files = sorted(Path("data/raw").glob("*.parquet")) + sorted(Path("data/orderbook").glob("*.parquet"))
-        if parquet_files:
-            chosen = st.selectbox("Parquet File", [str(p) for p in parquet_files], key="bt_parquet")
-            parquet_path = chosen
-        else:
-            st.warning("No parquet files found in data/raw/ or data/orderbook/.")
-            return
-
-    run_btn = st.button("Run Backtest", type="primary", key="bt_run")
-    if not run_btn:
-        return
-
-    with st.spinner("Loading data and running walk-forward folds — this may take a minute…"):
-        try:
-            loader = DataLoader(
-                source=source,
-                path=parquet_path,
-                csv_dir=str(cfg.data.csv_dir),
-            )
-            raw_df = loader.load()
-        except Exception as e:
-            st.error(f"Failed to load data: {e}")
-            return
-
-        try:
-            feat_df = build_features(
-                raw_df,
-                rv_windows=cfg.features.rv_windows,
-                ofi_window=cfg.features.ofi_window,
-                har_lags=cfg.features.har_lags,
-                horizons=[horizon],
-                ticks_per_second=cfg.features.ticks_per_second,
-                lob_levels=cfg.data.lob_levels,
-            )
-            fcols = feature_cols(feat_df, har_lags=cfg.features.har_lags, lob_levels=cfg.data.lob_levels)
-            rv_col    = f"target_rv_{horizon}s"
-            shock_col = f"target_shock_spread_{horizon}s"
-            extra = [c for c in [rv_col, shock_col, "spread"] if c in feat_df.columns and c not in fcols]
-            keep = fcols + extra
-            feat_df = clean(feat_df, keep)
-        except Exception as e:
-            st.error(f"Feature engineering failed: {e}")
-            return
-
-        try:
-            result = run_backtest(
-                feat_df, fcols,
-                horizon_s=horizon,
-                n_folds=n_folds,
-                shock_threshold=shock_threshold,
-                lgbm_params=cfg.models.lgbm_params,
-                verbose=False,
-            )
-        except Exception as e:
-            st.error(f"Backtest failed: {e}")
-            return
-
-    # ── Summary KPIs ────────────────────────────────────────────────────────
-    st.markdown('<div class="section-title" style="margin-top:1.5rem;">Summary</div>', unsafe_allow_html=True)
-    k1, k2, k3, k4, k5 = st.columns(5)
-    kpis = [
-        ("RMSE (mean)", f"{result.rmse_mean:.4e}", f"± {result.rmse_std:.2e}"),
-        ("MAE (mean)",  f"{result.mae_mean:.4e}",  ""),
-        ("AUROC (mean)",f"{result.auroc_mean:.4f}", f"± {result.auroc_std:.4f}"),
-        ("MM Sharpe",   f"{result.sharpe_mean:.2f}", "annualised"),
-        ("Total PnL",   f"{result.total_pnl:.4f}",  "sim units"),
-    ]
-    for col, (label, val, sub) in zip([k1, k2, k3, k4, k5], kpis):
-        with col:
-            st.markdown(
-                f'<div class="card" style="text-align:center;">'
-                f'<div class="metric-value" style="font-size:1.4rem;">{val}</div>'
-                f'<div style="font-size:0.7rem;color:{TEXT_DIM};margin-top:0.15rem;">{sub}</div>'
-                f'<div class="metric-label">{label}</div>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-
-    # ── Per-fold table ───────────────────────────────────────────────────────
-    st.markdown('<div class="section-title" style="margin-top:1.5rem;">Per-Fold Results</div>', unsafe_allow_html=True)
-    fold_rows = [
-        {
-            "Fold":          f.fold_idx,
-            "Train rows":    f.n_train,
-            "Test rows":     f.n_test,
-            "RV RMSE":       round(f.rv_metrics["rmse"], 6),
-            "RV MAE":        round(f.rv_metrics["mae"], 6),
-            "AUROC":         round(f.shock_metrics["auroc"], 4),
-            "MM Sharpe":     round(f.pnl["sharpe"], 2),
-            "Total PnL":     round(f.pnl["total_pnl"], 4),
-            "Max Drawdown":  round(f.pnl["max_drawdown"], 4),
-            "Participation": f"{f.pnl['participation']:.1%}",
-            "Fit time (s)":  round(f.fit_time_s, 1),
-        }
-        for f in result.folds
-    ]
-    st.dataframe(fold_rows, use_container_width=True)
-
-    # ── Cumulative PnL chart ─────────────────────────────────────────────────
-    st.markdown('<div class="section-title" style="margin-top:1.5rem;">Cumulative MM PnL (across all folds)</div>', unsafe_allow_html=True)
-    all_pnl = []
-    for f in result.folds:
-        all_pnl.extend(f.pnl["pnl_series"])
-    cum_pnl = np.cumsum(all_pnl)
-
-    fig_pnl = go.Figure()
-    fig_pnl.add_trace(go.Scatter(
-        y=cum_pnl,
-        mode="lines",
-        line=dict(color=ACCENT, width=1.5),
-        fill="tozeroy",
-        fillcolor=f"rgba(79,255,176,0.08)",
-        name="Cumulative PnL",
-    ))
-    fig_pnl.add_hline(y=0, line=dict(color=WARN, width=1, dash="dot"))
-    fig_pnl.update_layout(
-        **PLOTLY_THEME,
-        height=280,
-        showlegend=False,
-        xaxis=dict(title="Tick", **_AXIS_STYLE),
-        yaxis=dict(title="Cumulative PnL", **_AXIS_STYLE),
-    )
-    st.plotly_chart(fig_pnl, use_container_width=True)
-
-    # ── Per-fold RMSE and AUROC bars ─────────────────────────────────────────
-    fc1, fc2 = st.columns(2)
-    fold_idxs = [f.fold_idx for f in result.folds]
-
-    with fc1:
-        fig_rmse = go.Figure(go.Bar(
-            x=fold_idxs,
-            y=[f.rv_metrics["rmse"] for f in result.folds],
-            marker_color=ACCENT2,
-            name="RMSE",
-        ))
-        fig_rmse.update_layout(
-            **PLOTLY_THEME, height=220,
-            xaxis=dict(title="Fold", **_AXIS_STYLE),
-            yaxis=dict(title="RV RMSE", **_AXIS_STYLE),
-        )
-        st.plotly_chart(fig_rmse, use_container_width=True)
-
-    with fc2:
-        fig_auroc = go.Figure(go.Bar(
-            x=fold_idxs,
-            y=[f.shock_metrics["auroc"] for f in result.folds],
-            marker_color=ACCENT,
-            name="AUROC",
-        ))
-        fig_auroc.add_hline(y=0.5, line=dict(color=WARN, width=1, dash="dot"))
-        fig_auroc.update_layout(
-            **PLOTLY_THEME, height=220,
-            xaxis=dict(title="Fold", **_AXIS_STYLE),
-            yaxis=dict(title="Shock AUROC", range=[0, 1], **_AXIS_STYLE),
-        )
-        st.plotly_chart(fig_auroc, use_container_width=True)
-
-
 # ── Helpers ──────────────────────────────────────────────────────────────────
 def _no_data_box(msg: str):
     st.markdown(
@@ -1771,7 +1696,7 @@ def _no_data_box(msg: str):
 # ══════════════════════════════════════════════════════════════════════════════
 def main():
     page = render_topbar()
-    df      = load_latest_data()
+    df = load_latest_data()
     results = load_results()
 
     if page == "Features":
@@ -1780,11 +1705,6 @@ def main():
         page_models(results)
     elif page == "Live":
         page_live()
-    elif page == "Backtest":
-        if _IS_LOCAL:
-            page_backtest()
-        else:
-            st.error("Backtest is not available on the hosted deployment.")
 
 
 if __name__ == "__main__":

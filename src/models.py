@@ -139,22 +139,25 @@ class HARRVModel:
     HAR-RV baseline: OLS regression on rolling realized volatility lags.
 
     Corsi (2009) heterogeneous autoregressive model of realized volatility.
+    Only params are stored after fitting — statsmodels result objects carry
+    the full training data (~120MB) which is not needed for inference.
     """
 
     def __init__(self):
-        self.model = None
+        self.params = None
 
     def fit(self, X_train: np.ndarray, y_train: np.ndarray) -> HARRVModel:
         if X_train.size == 0 or X_train.shape[1] == 0:
             print("[HAR-RV] Insufficient features, skipping")
             return self
-        self.model = OLS(y_train, X_train).fit()
+        result = OLS(y_train, X_train).fit()
+        self.params = result.params.copy()
         return self
 
     def predict(self, X_test: np.ndarray) -> np.ndarray:
-        if self.model is None:
+        if self.params is None:
             return np.zeros(len(X_test))
-        return self.model.predict(X_test)
+        return X_test @ self.params
 
 
 class GARCHModel:

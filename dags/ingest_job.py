@@ -21,10 +21,9 @@ import re
 import sys
 import tempfile
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from urllib.parse import urljoin
-
 import requests
 from bs4 import BeautifulSoup
 from google.cloud import storage
@@ -73,18 +72,22 @@ def already_ingested(supabase_client, date_str: str) -> bool:
 
 
 def download_and_extract(url: str, dest_dir: Path) -> Path:
-    """Download zip, extract, return path to the .data file."""
+    """Download zip to disk (streaming), extract, return path to the .data file."""
     print(f"  Downloading {url}")
+    zip_path = dest_dir / "download.zip"
     with requests.get(url, stream=True, timeout=120) as r:
         r.raise_for_status()
-        raw = r.content
+        with open(zip_path, "wb") as f:
+            for chunk in r.iter_content(chunk_size=8 * 1024 * 1024):
+                f.write(chunk)
 
     try:
-        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+        with zipfile.ZipFile(zip_path, "r") as zf:
             zf.extractall(dest_dir)
     except zipfile.BadZipFile as e:
         raise ValueError(f"Bad ZIP from {url}") from e
 
+    zip_path.unlink()
     for p in dest_dir.rglob("*.data"):
         return p
     raise FileNotFoundError(f"No .data file found in ZIP from {url}")
@@ -129,16 +132,20 @@ def log_to_supabase(client, date_str: str, gcs_path: str, row_count: int, status
 
 def main():
     supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
 
     print("Fetching ZIP listing...")
     zip_urls = get_all_zip_urls()
-    print(f"Found {len(zip_urls)} ZIPs on source")
+    print(f"Found {len(zip_urls)} ZIPs on source — processing yesterday only ({yesterday})")
 
     new_count = 0
     for url in zip_urls:
         date_str = date_from_zip_url(url)
         if date_str is None:
             print(f"  SKIP (no date in URL): {url}")
+            continue
+
+        if date_str != yesterday:
             continue
 
         if already_ingested(supabase, date_str):
