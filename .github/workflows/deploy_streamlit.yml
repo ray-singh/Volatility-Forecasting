@@ -1,0 +1,54 @@
+name: Deploy Streamlit Dashboard
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app.py"
+      - "src/engineer.py"
+      - "src/config.py"
+      - "src/models.py"
+      - "src/kraken_feed.py"
+      - "src/bybit_feed.py"
+      - "Dockerfile.streamlit"
+      - "requirements.txt"
+
+env:
+  PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+  REGION: us-central1
+  IMAGE: gcr.io/${{ secrets.GCP_PROJECT_ID }}/volcast-streamlit
+  SERVICE_NAME: volcast-streamlit
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker for GCR
+        run: gcloud auth configure-docker --quiet
+
+      - name: Build image
+        run: docker build -f Dockerfile.streamlit -t $IMAGE:$GITHUB_SHA -t $IMAGE:latest .
+
+      - name: Push image
+        run: |
+          docker push $IMAGE:$GITHUB_SHA
+          docker push $IMAGE:latest
+
+      - name: Deploy to Cloud Run
+        run: |
+          gcloud run services replace deploy/cloudrun_streamlit.yaml \
+            --region $REGION \
+            --project $PROJECT_ID
