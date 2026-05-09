@@ -208,3 +208,23 @@ __marimo__/
 
 claude/
 .claude/
+
+# macOS
+.DS_Store
+
+# MLflow
+mlflow.db
+mlruns/
+
+# Model binaries (source of truth is GCS)
+models/*.pkl
+
+# Data files (large / generated / runtime)
+data/raw/
+data/csv/
+data/orderbook/
+data/eval_split_cache.npz
+data/live_buffer.parquet
+
+# Generated outputs
+lstm_comparison.json

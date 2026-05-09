@@ -618,6 +618,46 @@ def page_order_book(df):
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE: FEATURES
 # ══════════════════════════════════════════════════════════════════════════════
+_FEATURE_GROUPS = {
+    "Realized Volatility (RV)": {
+        "prefix": ("rv_",),
+        "desc": "Rolling sum of squared log-returns over a window of N ticks. "
+                "rv_50 = short-term vol (~25s); rv_300 = medium-term vol (~2.5 min).",
+        "color": ACCENT,
+    },
+    "HAR Components": {
+        "prefix": ("har_rv_",),
+        "desc": "Lagged RV values used by the HAR-RV model: rv_300 shifted back by 50 ticks, "
+                "giving the model a 'memory' of recent volatility regimes.",
+        "color": ACCENT2,
+    },
+    "Order Flow Imbalance (OFI)": {
+        "prefix": ("ofi_",),
+        "desc": "Net buy-minus-sell pressure at the best bid/ask over a rolling window. "
+                "Positive = more buying; negative = more selling.",
+        "color": "#06d6a0",
+    },
+    "Spread & Mid-Price": {
+        "prefix": ("spread", "mid_price", "log_ret"),
+        "desc": "Bid-ask spread in USD, mid-price, and tick-by-tick log-returns. "
+                "Spread measures liquidity cost; log-returns capture price momentum.",
+        "color": "#ffd166",
+    },
+    "Limit Order Book (LOB) Shape": {
+        "prefix": ("bid_p", "ask_p", "bid_q", "ask_q", "depth_ratio"),
+        "desc": "Price and quantity at each order book level (0 = best). "
+                "depth_ratio = total bid depth / total ask depth — >1 means buyers dominate.",
+        "color": WARN,
+    },
+}
+
+def _classify_feature(name: str) -> str:
+    for group, cfg in _FEATURE_GROUPS.items():
+        if any(name.startswith(p) for p in cfg["prefix"]):
+            return group
+    return "Other"
+
+
 def page_features(df):
     st.markdown('<div class="section-title">Feature Engineering</div>', unsafe_allow_html=True)
 
@@ -638,43 +678,100 @@ def page_features(df):
             ticks_per_second=cfg.ticks_per_second,
             lob_levels=5,
         )
-        fcols  = feature_cols(feat_df, har_lags=cfg.har_lags, lob_levels=5)
+        fcols = feature_cols(feat_df, har_lags=cfg.har_lags, lob_levels=5)
 
         if not fcols:
             _no_data_box("No feature columns found after engineering.")
             return
 
-        # ── Feature stats KPIs
-        c_cols = st.columns(min(len(fcols), 5))
-        for col, fc in zip(c_cols, fcols[:5]):
-            if fc in feat_df.columns:
-                mu = feat_df[fc].mean()
-                std = feat_df[fc].std()
-                with col:
-                    st.markdown(
-                        card(metric_html(fc, f"{mu:.4f}", f"σ {std:.4f}")),
-                        unsafe_allow_html=True,
-                    )
+        # ── Pipeline summary banner
+        n_rows = len(feat_df)
+        n_feats = len(fcols)
+        st.markdown(
+            f'<div class="info-box">'
+            f'<strong>{n_feats} features</strong> built from <strong>{n_rows:,} snapshots</strong>. '
+            f'Each snapshot is one order book state sampled at ~{cfg.ticks_per_second:.0f} ticks/sec. '
+            f'Features fall into five groups — RV windows, HAR lags, order flow, spread/price, '
+            f'and LOB shape. Models are trained on these features to forecast realized volatility '
+            f'{cfg.horizons} ticks ahead.'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Group legend cards
+        groups_present = {}
+        for fc in fcols:
+            g = _classify_feature(fc)
+            groups_present.setdefault(g, []).append(fc)
+
+        legend_groups = [g for g in _FEATURE_GROUPS if g in groups_present]
+        if "Other" in groups_present:
+            legend_groups.append("Other")
+
+        leg_cols = st.columns(len(legend_groups))
+        for col, g in zip(leg_cols, legend_groups):
+            gcfg = _FEATURE_GROUPS.get(g, {"color": TEXT_DIM, "desc": ""})
+            count = len(groups_present[g])
+            with col:
+                st.markdown(
+                    f'<div class="card" style="border-left:3px solid {gcfg["color"]};padding:0.8rem 1rem;">'
+                    f'<div class="card-header" style="color:{gcfg["color"]}">{g}</div>'
+                    f'<div style="font-size:0.72rem;color:{TEXT_DIM};margin-bottom:0.4rem;">{count} feature{"s" if count>1 else ""}</div>'
+                    f'<div style="font-size:0.72rem;color:{TEXT_DIM};line-height:1.5">{gcfg["desc"]}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # ── Feature time series
+        # ── Summary stats for key features
+        st.markdown('<div class="section-title">Key Feature Statistics</div>', unsafe_allow_html=True)
+        highlight = [fc for fc in fcols if fc in ("rv_50", "rv_300", "ofi_20", "spread", "depth_ratio", "har_rv_50")]
+        highlight = [fc for fc in highlight if fc in feat_df.columns] or fcols[:5]
+        stat_cols = st.columns(len(highlight))
+        for col, fc in zip(stat_cols, highlight):
+            mu = feat_df[fc].mean()
+            std = feat_df[fc].std()
+            group = _classify_feature(fc)
+            color = _FEATURE_GROUPS.get(group, {}).get("color", TEXT_DIM)
+            with col:
+                st.markdown(
+                    f'<div class="card" style="border-top:2px solid {color};">'
+                    + metric_html(fc, f"{mu:.4g}", f"σ = {std:.4g}")
+                    + f'<div style="font-size:0.65rem;color:{TEXT_DIM};margin-top:0.3rem">{group}</div>'
+                    + '</div>',
+                    unsafe_allow_html=True,
+                )
+
+        st.markdown("<br>", unsafe_allow_html=True)
+
+        # ── Feature time series (grouped selector)
         st.markdown('<div class="section-title">Feature Time Series</div>', unsafe_allow_html=True)
-        selected = st.multiselect(
-            "Select features", fcols,
-            default=fcols[:3],
-            key="feat_sel",
+
+        group_filter = st.selectbox(
+            "Filter by group",
+            ["All"] + legend_groups,
+            key="feat_group_filter",
         )
+        filtered_fcols = (
+            fcols if group_filter == "All"
+            else [fc for fc in fcols if _classify_feature(fc) == group_filter]
+        )
+        default_sel = filtered_fcols[:min(3, len(filtered_fcols))]
+        selected = st.multiselect("Select features to plot", filtered_fcols, default=default_sel, key="feat_sel")
 
         if selected:
-            fig = go.Figure()
             palette = [ACCENT, ACCENT2, WARN, "#ffd166", "#06d6a0", "#118ab2"]
+            fig = go.Figure()
             for i, fc in enumerate(selected):
                 if fc in feat_df.columns:
+                    gcfg = _FEATURE_GROUPS.get(_classify_feature(fc), {})
                     fig.add_trace(go.Scatter(
                         y=feat_df[fc].to_list(),
                         name=fc,
-                        line=dict(color=palette[i % len(palette)], width=1.3),
+                        line=dict(color=gcfg.get("color", palette[i % len(palette)]), width=1.3),
+                        hovertemplate=f"<b>{fc}</b><br>snapshot %{{x}}<br>value %{{y:.4g}}<extra></extra>",
                     ))
             fig.update_layout(**PLOTLY_THEME, height=350)
             _apply_axis_style(fig)
@@ -682,9 +779,23 @@ def page_features(df):
             fig.update_yaxes(title_text="Feature Value")
             st.plotly_chart(fig, use_container_width=True)
 
-        # ── Correlation heatmap
+        # ── Correlation heatmap (limited to one group or top features)
         st.markdown('<div class="section-title">Correlation Matrix</div>', unsafe_allow_html=True)
-        numeric = [c for c in fcols if c in feat_df.columns][:15]
+        st.caption(
+            "Shows pairwise Pearson correlation between features. "
+            "Dark red = strong positive correlation; dark blue = strong negative. "
+            "Highly correlated features (|r| > 0.9) carry redundant information."
+        )
+        corr_group = st.selectbox(
+            "Show correlations for group",
+            ["Top 15 overall"] + legend_groups,
+            key="feat_corr_group",
+        )
+        if corr_group == "Top 15 overall":
+            numeric = [c for c in fcols if c in feat_df.columns][:15]
+        else:
+            numeric = [c for c in groups_present.get(corr_group, []) if c in feat_df.columns][:20]
+
         if len(numeric) > 1:
             corr = feat_df.select(numeric).to_pandas().corr()
             fig = px.imshow(
@@ -693,7 +804,7 @@ def page_features(df):
                 color_continuous_midpoint=0,
                 aspect="auto",
             )
-            fig.update_layout(**PLOTLY_THEME, height=420,
+            fig.update_layout(**PLOTLY_THEME, height=max(380, 28 * len(numeric)),
                               coloraxis_colorbar=dict(tickfont=dict(color=TEXT_DIM, size=9)))
             _apply_axis_style(fig)
             fig.update_traces(
@@ -701,6 +812,8 @@ def page_features(df):
                 hovertemplate="%{x} × %{y}<br>r = %{z:.3f}<extra></extra>",
             )
             st.plotly_chart(fig, use_container_width=True)
+        else:
+            _no_data_box("Not enough features in this group to show a correlation matrix.")
 
     except Exception as e:
         st.error(f"Feature engineering failed: {e}")

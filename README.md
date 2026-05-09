@@ -1,6 +1,6 @@
 # Volatility & Liquidity Forecasting from Limit Order Book Data
 
-An end-to-end market microstructure research pipeline for forecasting short-horizon realized volatility and liquidity shocks using Level-2 (L2) limit order book data. Built on 5.5M rows of BTC/USD tick data with 5 LOB levels.
+A cloud-native market microstructure research pipeline for forecasting short-horizon realized volatility and liquidity shocks using Level-2 (L2) limit order book data. Built on 5.5M+ rows of BTC/USD tick data with 5 LOB levels.
 
 ## What it does
 
@@ -8,7 +8,7 @@ An end-to-end market microstructure research pipeline for forecasting short-hori
 - **Classification**: detects liquidity shocks — bid-ask spread expansions and depth depletions
 - **Live feed**: streams real-time LOB snapshots from Kraken/Bybit WebSocket APIs
 - **Dashboard**: Streamlit app with feature analysis, model comparison, and live inference
-- **Cloud serving**: FastAPI inference API on Cloud Run (scale-to-zero); nightly ingest job on Cloud Run Jobs
+- **Cloud serving**: FastAPI inference API + Streamlit dashboard on Cloud Run (scale-to-zero); nightly ingest and weekly retraining on Cloud Run Jobs
 
 ## Models
 
@@ -20,28 +20,55 @@ An end-to-end market microstructure research pipeline for forecasting short-hori
 | TCN | Deep learning | Temporal Convolutional Network, PyTorch |
 | Transformer | Deep learning | Self-attention sequence model, PyTorch |
 
-## Results (5s horizon)
+## Results
 
-| Model | RMSE | AUROC |
-|---|---|---|
-| HAR-RV | 6.99e-05 | — |
-| GARCH | 7.80e-05 | — |
-| LightGBM | 6.70e-05 | 0.843 |
+### Realized volatility regression (RMSE)
 
-*TCN and Transformer metrics populated after running `evaluate_deep.py`.*
+| Model | 1s | 5s | 30s |
+|---|---|---|---|
+| HAR-RV | 1.23e-04 | 1.15e-04 | 3.67e-04 |
+| LightGBM | **6.70e-05** | **1.09e-04** | **1.88e-04** |
+| TCN | — | 1.40e-03 | — |
+| Transformer | — | 1.25e-04 | — |
+
+### Liquidity shock classification (AUROC / AUPRC)
+
+| Model | 1s | 5s | 30s |
+|---|---|---|---|
+| LightGBM | 0.943 / 0.880 | 0.843 / 0.795 | 0.808 / 0.916 |
+| TCN | — | 0.830 / 0.793 | — |
+| Transformer | — | 0.836 / 0.805 | — |
+
+### Feature ablation (5s LGBM, delta RMSE vs baseline 1.09e-04)
+
+| Feature group removed | ΔRMSE |
+|---|---|
+| RV windows | +8.3e-07 |
+| HAR lags | +5.0e-07 |
+| Book shape | +4.2e-07 |
+| OFI | +1.5e-07 |
+| Spread | +1.4e-07 |
+| Depth | +1.4e-07 |
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    subgraph Ingest["Data Ingestion  ·  Cloud Run Job (nightly)"]
+    subgraph Ingest["Data Ingestion  ·  Cloud Run Job (nightly 05:00 UTC)"]
         K[kraken_feed.py\nWebSocket / REST]
         B[bybit.py\nWebSocket]
-        SC[scraping.py\nCloud Run Job]
+        SC[dags/ingest_job.py\nCloud Run Job]
         K --> CSV[data/csv/\nLOB snapshots]
         B --> PQ[data/orderbook/\nparquet]
         SC --> GCS[(GCS\nvolcast-ray-volcast-prod)]
         SC --> SB[(Supabase\ningest_log)]
+    end
+
+    subgraph Retrain["Retraining  ·  Cloud Run Job (weekly Sun 06:00 UTC)"]
+        GCS --> RT[dags/retrain_job.py]
+        RT --> ML2[src/train.py\nLGBM + HAR]
+        ML2 --> GCS
+        ML2 --> SB2[(Supabase\nretrain_log)]
     end
 
     subgraph Prep["Preprocessing"]
@@ -85,7 +112,7 @@ flowchart TD
 
     subgraph Serve["Serving & Visualisation"]
         GCS --> API[src/serving.py\nFastAPI · Cloud Run\nvolcast-serve-....run.app]
-        RJ --> UI[app.py\nStreamlit dashboard]
+        GCS --> UI[app.py\nStreamlit · Cloud Run\nvolcast-streamlit-....run.app]
         API --> UI
         PAR --> UI
     end
@@ -95,6 +122,9 @@ flowchart TD
 
 ```
 ├── app.py                      # Streamlit dashboard (entry point)
+├── dags/
+│   ├── ingest_job.py           # Cloud Run Job: nightly scrape → GCS + Supabase
+│   └── retrain_job.py          # Cloud Run Job: weekly LGBM + HAR retrain
 ├── src/
 │   ├── config.py               # PipelineConfig (horizons, fractions, LOB levels)
 │   ├── engineer.py             # Feature engineering (RV, OFI, spread, depth, HAR lags)
@@ -111,12 +141,15 @@ flowchart TD
 │   ├── make_parquet.py         # Convert raw CSVs to parquet
 │   └── convert_data.py         # Data format utilities
 ├── deploy/
-│   ├── cloudrun_job.yaml       # Cloud Run Job spec (nightly ingest)
-│   ├── cloudrun_serve.yaml     # Cloud Run Service spec (FastAPI, scale-to-zero)
-│   ├── cloudbuild.yaml         # Cloud Build: training job image
-│   ├── cloudbuild_serve.yaml   # Cloud Build: serving image
-│   ├── supabase_schema.sql     # Supabase ingest_log table DDL
-│   └── scheduler.sh            # Cloud Scheduler setup script
+│   ├── cloudrun_job.yaml         # Cloud Run Job spec (nightly ingest)
+│   ├── cloudrun_retrain.yaml     # Cloud Run Job spec (weekly retraining)
+│   ├── cloudrun_serve.yaml       # Cloud Run Service spec (FastAPI, scale-to-zero)
+│   ├── cloudrun_streamlit.yaml   # Cloud Run Service spec (Streamlit dashboard)
+│   ├── cloudbuild.yaml           # Cloud Build: ingest job image
+│   ├── cloudbuild_serve.yaml     # Cloud Build: serving image
+│   ├── cloudbuild_streamlit.yaml # Cloud Build: Streamlit dashboard image
+│   ├── supabase_schema.sql       # Supabase DDL (ingest_log + retrain_log)
+│   └── scheduler.sh              # Cloud Scheduler setup script
 ├── .github/workflows/
 │   ├── deploy_job.yml          # CI: push ingest job image on merge
 │   └── deploy_serve.yml        # CI: push serving image on merge
@@ -159,50 +192,20 @@ All production workloads run on Google Cloud Platform.
 
 | Component | Service | Notes |
 |---|---|---|
-| Ingest job | Cloud Run Jobs | Nightly scrape → GCS + Supabase metadata log |
-| Training | Cloud Run Jobs | Triggered manually or via Cloud Scheduler |
+| Ingest job | Cloud Run Jobs | Nightly 05:00 UTC — scrape → GCS + `ingest_log` |
+| Retrain job | Cloud Run Jobs | Weekly Sun 06:00 UTC — LGBM + HAR on rolling 7-day window → GCS + `retrain_log` |
 | Inference API | Cloud Run (scale-to-zero) | `volcast-serve-3988143537.us-central1.run.app` |
-| Model storage | GCS `volcast-ray-volcast-prod` | `models/lgbm_model_*.pkl`, `results.json` |
-| Metadata | Supabase `ingest_log` | Date, row count, GCS path, status per ingest run |
+| Dashboard | Cloud Run (scale-to-zero) | `volcast-streamlit-3988143537.us-central1.run.app` |
+| Model storage | GCS `volcast-ray-volcast-prod` | `models/lgbm_model_*.pkl`, `results.json` (7-day lifecycle) |
+| Metadata | Supabase | `ingest_log` (per-day ingest status) + `retrain_log` (per-run retrain metrics) |
 | CI/CD | GitHub Actions + Workload Identity | Pushes images to GCR, deploys on merge to `main` |
 
 ### Model lifecycle
 
-1. `src/train.py` trains LightGBM models and saves `models/lgbm_model_{1s,5s,30s}.pkl` + `results.json`
-2. At end of training, all pkl files and `results.json` are uploaded to `gs://volcast-ray-volcast-prod/`
-3. At Cloud Run startup, `src/serving.py` downloads only `lgbm_model_*.pkl` files from GCS (deep model pkls are skipped — no torch in the serving image)
-```
-
-## Walk-forward backtest
-
-`src/backtest.py` runs expanding-window cross-validation to produce statistically robust out-of-sample metrics. Each fold retrains LightGBM on all available history and predicts the next held-out block, eliminating the optimism bias of a single train/test split.
-
-```
-python -m src.backtest --source parquet --path data/... --n-folds 8 --horizon 5
-```
-
-Output (example):
-```
-  Fold    Train    Test       RMSE    AUROC   Sharpe        PnL   Time
-  ──────────────────────────────────────────────────────────────────────
-  0      22000    5500   3.21e-05   0.8312     1.84     0.0043   12.1s
-  1      27500    5500   3.18e-05   0.8290     1.91     0.0051   14.3s
-  ...
-  MEAN                  3.19e-05   0.8301     1.88     0.0239
-  STD                   0.04e-05   0.0019
-```
-
-Also outputs a **market-making PnL simulation** per fold — the MM quotes when predicted shock probability is below threshold and sits out otherwise, converting AUROC into a concrete Sharpe ratio.
-
-## Target variables
-
-| Target | Description |
-|---|---|
-| `target_rv_{h}s` | Forward realized volatility over horizon h |
-| `target_log_rv_{h}s` | log(RV + ε) — approximately Gaussian (Andersen et al. 2001) |
-| `target_shock_spread_{h}s` | Spread exceeds Q75 within horizon (binary) |
-| `target_vol_jump_{h}s` | RV exceeds µ + 2σ of trailing 300-tick window (sharper shock signal) |
-| `target_shock_depth_{h}s` | Depth ratio drops below Q25 within horizon (binary) |
+1. `dags/retrain_job.py` downloads all available `orderbook/*.parquet` files from GCS (up to 7 days)
+2. `src/train.py` retrains LGBM + HAR, saves `models/lgbm_model_{1s,5s,30s}.pkl` + `results.json`, and uploads them to GCS
+3. At Cloud Run startup, `src/serving.py` downloads only `lgbm_model_*.pkl` from GCS (TCN/Transformer skipped — no torch in the serving image)
+4. TCN and Transformer are retrained manually on Kaggle (GPU required) and uploaded to GCS separately
 
 ## Stack
 

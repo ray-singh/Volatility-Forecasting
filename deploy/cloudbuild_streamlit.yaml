@@ -1,0 +1,5 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-f', 'Dockerfile.streamlit', '-t', 'gcr.io/$PROJECT_ID/volcast-streamlit:latest', '.']
+images:
+  - 'gcr.io/$PROJECT_ID/volcast-streamlit:latest'

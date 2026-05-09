@@ -128,6 +128,40 @@ def log_to_supabase(client, date_str: str, gcs_path: str, row_count: int, status
     }, on_conflict="date").execute()
 
 
+# ── step 5: trigger retraining ───────────────────────────────────────────────
+
+GCP_PROJECT = os.environ.get("GOOGLE_CLOUD_PROJECT", "ray-volcast-prod")
+GCP_REGION = os.environ.get("GCP_REGION", "us-central1")
+RETRAIN_JOB_NAME = "volcast-retrain"
+
+
+def trigger_retrain() -> None:
+    """Fire the volcast-retrain Cloud Run Job via the Jobs API (async)."""
+    import google.auth
+    import google.auth.transport.requests
+
+    credentials, _ = google.auth.default(
+        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    )
+    credentials.refresh(google.auth.transport.requests.Request())
+
+    url = (
+        f"https://run.googleapis.com/v2/projects/{GCP_PROJECT}"
+        f"/locations/{GCP_REGION}/jobs/{RETRAIN_JOB_NAME}:run"
+    )
+    resp = requests.post(
+        url,
+        headers={"Authorization": f"Bearer {credentials.token}"},
+        json={},
+        timeout=30,
+    )
+    if resp.ok:
+        print(f"  ✓ Triggered {RETRAIN_JOB_NAME} (operation: {resp.json().get('name')})")
+    else:
+        print(f"  ⚠ Failed to trigger {RETRAIN_JOB_NAME}: {resp.status_code} {resp.text}",
+              file=sys.stderr)
+
+
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -156,7 +190,7 @@ def main():
         gcs_path = ""
         try:
             with tempfile.TemporaryDirectory() as tmp:
-                data_file              = download_and_extract(url, Path(tmp))
+                data_file = download_and_extract(url, Path(tmp))
                 parquet_bytes, n_rows = data_file_to_parquet_bytes(data_file)
 
             print(f"  {n_rows:,} rows reconstructed")
@@ -170,6 +204,7 @@ def main():
             log_to_supabase(supabase, date_str, gcs_path, 0, "error", str(exc))
 
     print(f"\nDone. {new_count} new date(s) ingested.")
+
 
 
 if __name__ == "__main__":

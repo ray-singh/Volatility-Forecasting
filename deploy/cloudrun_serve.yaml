@@ -1,0 +1,26 @@
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: volcast-serve
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        autoscaling.knative.dev/maxScale: "2"
+    spec:
+      serviceAccountName: volcast-serve@ray-volcast-prod.iam.gserviceaccount.com
+      timeoutSeconds: 60
+      containers:
+        - image: gcr.io/ray-volcast-prod/volcast-serve:latest
+          resources:
+            limits:
+              cpu: "1"
+              memory: 2Gi
+          env:
+            - name: GCS_BUCKET
+              value: volcast-ray-volcast-prod
+            - name: LOB_LEVELS
+              value: "5"
+          ports:
+            - containerPort: 8000

@@ -1,0 +1,5 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-f', 'Dockerfile.serve', '-t', 'gcr.io/$PROJECT_ID/volcast-serve:latest', '.']
+images:
+  - 'gcr.io/$PROJECT_ID/volcast-serve:latest'

@@ -1,8 +1,7 @@
 apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
-  name: volcast-ingest
-  # Replace with your GCP region
+  name: volcast-retrain
   annotations:
     run.googleapis.com/launch-stage: GA
 spec:
@@ -10,17 +9,16 @@ spec:
     spec:
       template:
         spec:
-          # Retry once on failure before marking job failed
-          maxRetries: 1
-          # Use a dedicated service account with GCS + Secret Manager permissions
+          maxRetries: 0
           serviceAccountName: volcast-ingest-sa@ray-volcast-prod.iam.gserviceaccount.com
           timeoutSeconds: 3600
           containers:
             - image: gcr.io/ray-volcast-prod/volcast-ingest:latest
+              command: ["python", "-m", "dags.retrain_job"]
               resources:
                 limits:
-                  cpu: "2"
-                  memory: 4Gi
+                  cpu: "4"
+                  memory: 8Gi
               env:
                 - name: GCS_BUCKET
                   value: volcast-ray-volcast-prod
