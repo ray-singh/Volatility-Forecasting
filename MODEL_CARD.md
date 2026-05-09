@@ -225,11 +225,6 @@ This model is designed for **passive observation** (risk management, analysis). 
 
 ## References & Citations
 
-### Papers
-- Andersen, T. G., Bollerslev, T., Diebold, F. X., & Labys, P. (2001). The distribution of realized exchange rate volatility. *J. Am. Stat. Assoc.*, 96(453), 42–55.
-- Hasbrouck, J., & Saar, G. (2013). Low-latency trading. *J. Financial Markets*, 16(4), 646–679.
-- Huang, X., Rojas, O., & Tookes, H. (2020). The limits of robo advising. *Rev. Financial Stud.*, 34(2), 739–779.
-
 ### Datasets
 - Bybit L2 orderbook snapshots: `data/orderbook/btcusd_full.parquet`
 - Backtesting snapshots: `data/raw/kraken_XBTUSD_*.parquet`
@@ -238,21 +233,3 @@ This model is designed for **passive observation** (risk management, analysis). 
 - LightGBM: https://github.com/microsoft/LightGBM (Ke et al., 2017)
 - Baseline: HAR-RV (Corsi, 2009), GARCH (Bollerslev, 1986)
 
----
-
-## Contact & Support
-
-**Model Owner**: Rayansh Singh  
-**Email**: rayansh365@gmail.com  
-**Repository**: https://github.com/rayanshsingh/Volatility-Forecasting
-
-For questions, issues, or to report model degradation:
-1. Open a GitHub issue
-2. Check MLflow dashboard for recent training metrics
-3. Contact maintainer for urgent production issues
-
----
-
-**Last Updated**: April 23, 2025  
-**Model Version**: 1.0  
-**Status**: Production

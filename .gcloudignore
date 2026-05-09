@@ -1,0 +1,16 @@
+.gcloudignore
+.git
+.gitignore
+venv/
+data/
+mlruns/
+models/
+__pycache__/
+*.pyc
+*.pkl
+*.parquet
+*.npz
+*.db
+*.ipynb
+tests/
+scripts/

@@ -1364,12 +1364,16 @@ def page_models(results):
                     unsafe_allow_html=True)
         col_a, col_b = st.columns(2)
 
-        ph5_shock = (results.get("per_horizon") or {}).get("5s", {}).get("lgbm_shock", {})
+        ph5_all = (results.get("per_horizon") or {}).get("5s", {})
         auroc_data = {k: v for k, v in {
-            "LightGBM": ph5_shock.get("auroc") or results.get("auroc"),
+            "LightGBM":    ph5_all.get("lgbm_shock",        {}).get("auroc") or results.get("auroc"),
+            "TCN":         ph5_all.get("tcn_shock",         {}).get("auroc") or results.get("tcn_auroc"),
+            "Transformer": ph5_all.get("transformer_shock", {}).get("auroc") or results.get("transformer_auroc"),
         }.items() if v is not None}
         auprc_data = {k: v for k, v in {
-            "LightGBM": ph5_shock.get("auprc") or results.get("auprc"),
+            "LightGBM":    ph5_all.get("lgbm_shock",        {}).get("auprc") or results.get("auprc"),
+            "TCN":         ph5_all.get("tcn_shock",         {}).get("auprc") or results.get("tcn_auprc"),
+            "Transformer": ph5_all.get("transformer_shock", {}).get("auprc") or results.get("transformer_auprc"),
         }.items() if v is not None}
 
         def bar_chart(data, title, yref=None):
@@ -1584,15 +1588,14 @@ def page_live():
     if stream_key not in st.session_state:
         st.session_state[stream_key] = None
 
-    # Auto-start stream on first visit
-    if st.session_state[stream_key] is None or not st.session_state[stream_key].is_running:
-        stream = _make_stream(is_bybit, pair)
-        stream.start()
-        st.session_state[stream_key] = stream
-
     c_start, c_stop = col_ctl.columns(2)
+    stream_running = (
+        st.session_state[stream_key] is not None
+        and st.session_state[stream_key].is_running
+    )
     with c_start:
-        if st.button("▶ Restart Stream", key="live_start"):
+        btn_label = "▶ Restart Stream" if stream_running else "▶ Start Stream"
+        if st.button(btn_label, key="live_start"):
             s = st.session_state.get(stream_key)
             if s is not None:
                 s.stop()
@@ -1629,37 +1632,39 @@ def page_live():
                 unsafe_allow_html=True,
             )
 
-    n_snapshots = len(stream.snapshot_deque) if stream else 0
-    # rv_300 needs 300 ticks; require 310 so the last row has a full window.
+    # rv_300 needs 300 ticks before feature windows are fully populated.
     _MIN_ROWS = 310
-    if stream is None or not stream.is_running or n_snapshots < _MIN_ROWS:
-        pct = int(n_snapshots / _MIN_ROWS * 100) if stream else 0
-        _no_data_box(
-            f"Warming up… {n_snapshots}/{_MIN_ROWS} snapshots "
-            f"({pct}%) — predictions appear once the 300-tick RV window fills."
-        )
-        if stream and stream.is_running:
-            st.rerun()
+
+    if stream is None or not stream.is_running:
+        _no_data_box("Press ▶ Start Stream to connect and begin receiving data.")
+        return
+
+    n_snapshots = len(stream.snapshot_deque)
+    if n_snapshots == 0:
+        _no_data_box("Connected — waiting for first snapshot…")
+        st.rerun()
         return
 
     rows = list(stream.snapshot_deque)
     latest = rows[-1]
-
-    # ── KPI strip: mid, spread, predictions ──────────────────────────────────
-    lgbm_models = _load_lgbm_models()
-    result = _build_live_features(rows)
-    feat_df, fcols = result if result is not None else (None, [])
-    preds = {}
-    if _API_URL:
-        api_preds = _predict_via_api(rows)
-        if api_preds is not None:
-            preds = api_preds
-    if not preds and feat_df is not None:
-        preds = _predict_live(feat_df, fcols, lgbm_models)
-
     mid = latest.get("mid_price", 0)
     spread = latest.get("spread", 0)
 
+    # ── Predictions (only available once RV windows are full) ─────────────────
+    preds = {}
+    feat_df, fcols, result = None, [], None
+    if n_snapshots >= _MIN_ROWS:
+        lgbm_models = _load_lgbm_models()
+        result = _build_live_features(rows)
+        feat_df, fcols = result if result is not None else (None, [])
+        if _API_URL:
+            api_preds = _predict_via_api(rows)
+            if api_preds is not None:
+                preds = api_preds
+        if not preds and feat_df is not None:
+            preds = _predict_live(feat_df, fcols, lgbm_models)
+
+    # ── KPI strip: mid, spread, predictions ──────────────────────────────────
     kpi_cols = st.columns(2 + len(preds) * 2)
     with kpi_cols[0]:
         st.markdown(card(metric_html("Mid Price", f"${mid:,.2f}")), unsafe_allow_html=True)
@@ -1737,7 +1742,7 @@ def page_live():
     n_chart = min(len(rows), 300)
     chart_rows = rows[-n_chart:]
     mids = [r["mid_price"] for r in chart_rows]
-    spreads = [r["spread"]    for r in chart_rows]
+    spreads = [r["spread"] for r in chart_rows]
     xs = list(range(len(chart_rows)))
 
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
@@ -1760,8 +1765,8 @@ def page_live():
     fig.update_xaxes(title_text="Snapshot #", row=2, col=1)
     st.plotly_chart(fig, use_container_width=True)
 
-    # ── Rolling RV forecast chart ─────────────────────────────────────────────
-    if result is not None and len(feat_df) > 1:
+    # ── Rolling RV forecast chart (requires full RV window) ───────────────────
+    if n_snapshots >= _MIN_ROWS and result is not None and feat_df is not None and len(feat_df) > 1:
         st.markdown('<div class="section-title">Rolling Volatility Forecast</div>',
                     unsafe_allow_html=True)
         rv_fig = go.Figure()
