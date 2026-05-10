@@ -28,6 +28,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
+from .buffer import LOBBuffer
 from .config import FeatureConfig
 from .engineer import build_features, clean, feature_cols
 
@@ -43,6 +44,7 @@ _feat_cfg = FeatureConfig()
 # ── Model registry ────────────────────────────────────────────────────────────
 
 _models: dict[str, Any] = {}
+_buffer: LOBBuffer | None = None
 
 
 class _ModuleRemapUnpickler(pickle.Unpickler):
@@ -127,7 +129,9 @@ app.add_middleware(
 
 @app.on_event("startup")
 def startup() -> None:
+    global _buffer
     _load_models()
+    _buffer = LOBBuffer(capacity=300, lob_levels=LOB_LEVELS)
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -271,6 +275,52 @@ def predict(req: PredictRequest) -> PredictResponse:
     return PredictResponse(
         n_snapshots=len(req.snapshots),
         n_features_used=len(fcols),
+        predictions=predictions,
+    )
+
+
+class PushResponse(BaseModel):
+    ticks_buffered: int
+    ready: bool
+    predictions: dict[str, HorizonPrediction] | None = None
+
+
+@app.post("/push", response_model=PushResponse)
+def push(snap: LOBSnapshot) -> PushResponse:
+    """
+    Ingest a single LOB snapshot into the server-side ring buffer and,
+    once enough ticks have accumulated, return predictions immediately.
+
+    Feature engineering is O(1) per tick — no DataFrame recompute.
+    This is the low-latency path; use /predict for one-off batch inference.
+    """
+    if _buffer is None or not _models:
+        raise HTTPException(status_code=503, detail="Server not ready")
+
+    _buffer.push(snap.model_dump())
+
+    if not _buffer.ready:
+        return PushResponse(ticks_buffered=_buffer._n_ticks, ready=False)
+
+    feat = _buffer.features().reshape(1, -1)
+
+    predictions: dict[str, HorizonPrediction] = {}
+    for horizon, model in _models.items():
+        try:
+            rv_val = float(np.clip(model.predict_rv(feat)[0], 0, None))
+            proba = model.predict_shock_proba(feat)[0]
+            shock_p = float(proba[1]) if len(proba) > 1 else float(proba[0])
+            predictions[horizon] = HorizonPrediction(
+                rv=rv_val,
+                shock_probability=round(shock_p, 6),
+                shock_flag=shock_p > 0.5,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Inference failed for {horizon}: {exc}")
+
+    return PushResponse(
+        ticks_buffered=_buffer._n_ticks,
+        ready=True,
         predictions=predictions,
     )
 
